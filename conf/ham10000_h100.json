@@ -1,0 +1,11 @@
+{
+    "init_epoch" : "10",
+    "epoch" : "100",
+    "id_dataset" : "/home/work/DATA2/ham10000/ham10000",
+    "batch_size" : 32,
+    "save_path" : "./checkpoints/HAM10000/",
+    "num_classes" : 7,
+    "kd_lambda": 1.0,
+    "mkd_lambda": 1.0,
+    "kd_temperature": 1.0
+}
