@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from imbalanced_dataset_sampler.torchsampler.imbalanced import ImbalancedDatasetSampler
 import util
+from util.util import get_instance_noisy_label
 import dino_variant
 from rein import LoRAFusedDualReinsDinoVisionTransformer, ReinsDinoVisionTransformer
 
@@ -161,7 +162,6 @@ def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', '-d', type=str)
     parser.add_argument('--gpu', '-g', default='0', type=str)
-    parser.add_argument('--netsize', default='s', type=str)
     parser.add_argument('--learning_rate', type=float, default=1e-3)
     parser.add_argument('--save_path', '-s', type=str)
     parser.add_argument('--seed', type=int, default=41)
@@ -194,18 +194,12 @@ def train():
 
     dataset_train, dataset_test, dict_users = util.get_dataset(args)
     y_train = np.array(dataset_train.targets)
+
     y_train_noisy, _, _ = util.add_noise(args, y_train, dict_users)
     dataset_train.targets = y_train_noisy
 
-    if args.netsize == 's':
-        model_load = dino_variant._small_dino
-        variant = dino_variant._small_variant
-    elif args.netsize == 'b':
-        model_load = dino_variant._base_dino
-        variant = dino_variant._base_variant
-    else:
-        model_load = dino_variant._large_dino
-        variant = dino_variant._large_variant
+    model_load = dino_variant._small_dino
+    variant = dino_variant._small_variant
 
     pretrained = torch.hub.load('facebookresearch/dinov2', model_load)
     dino_state_dict = pretrained.state_dict()

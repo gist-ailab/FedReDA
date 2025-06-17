@@ -1,10 +1,12 @@
 from PIL import Image
+import torch.utils.data as Data
 import os
 import numpy as np
 import torch
 from torchvision import datasets, transforms
 from util.sampling import iid_sampling, non_iid_dirichlet_sampling
 import torch.utils
+import util
 
 def get_transform(transform_type='default', image_size=224, args=None):
 
@@ -56,26 +58,6 @@ def get_dataset(args):
         n_train = len(dataset_train)
         y_train = np.array(dataset_train.targets)
 
-    elif args.data == 'clothing1m':
-        data_path = os.path.abspath('..') + '/data/clothing1M/'
-        args.num_classes = 14
-        trans_train = transforms.Compose([
-                    transforms.Resize((256, 256)),
-                    transforms.RandomCrop(224),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                 ])
-        trans_val = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                 ])
-        dataset_train = Clothing(data_path, trans_train, "train")
-        dataset_test = Clothing(data_path, trans_val, "test")
-        n_train = len(dataset_train)
-        y_train = np.array(dataset_train.targets)
-
     elif args.data == 'ham10000':
         data_path = '/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000'
         args.num_classes = 7  # HAM10000은 7개 클래스
@@ -98,67 +80,138 @@ def get_dataset(args):
 
     return dataset_train, dataset_test, dict_users
 
-
-class Clothing(torch.utils.data.Dataset):
-    def __init__(self, root, transform, mode):
-        self.root = root
-        self.noisy_labels = {}
-        self.clean_labels = {}
-        self.data = []
-        self.targets = []
+class ham10000_dataset(Data.Dataset):
+    def __init__(self, train=True, transform=None, target_transform=None, noise_rate=0.3, split_percentage=0.9, seed=1, num_classes=7, feature_size=3*224*224, norm_std=0.1):
+            
         self.transform = transform
-        self.mode = mode
+        self.target_transform = target_transform
+        self.train = train 
+        
+        original_images = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/train_images.npy', allow_pickle=True)
+        original_labels = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/train_labels.npy', allow_pickle=True)
+        data = torch.from_numpy(original_images).float()
+        targets = torch.from_numpy(original_labels)
 
-        with open(self.root + 'noisy_label_kv.txt', 'r') as f:
-            lines = f.read().splitlines()
-        for l in lines:
-            entry = l.split()
-            img_path = self.root + entry[0]
-            self.noisy_labels[img_path] = int(entry[1])
+        dataset = zip(data, targets)
+        
+        new_labels = util.get_instance_noisy_label(noise_rate, dataset, targets, num_classes, feature_size, norm_std, seed)
 
-        with open(self.root + 'clean_label_kv.txt', 'r') as f:
-            lines = f.read().splitlines()
-        for l in lines:
-            entry = l.split()
-            img_path = self.root + entry[0]
-            self.clean_labels[img_path] = int(entry[1])
-
-        if self.mode == 'train':
-            with open(self.root + 'noisy_train_key_list.txt', 'r') as f:
-                lines = f.read().splitlines()
-            for l in lines:
-                img_path = self.root + l
-                self.data.append(img_path)
-                target = self.noisy_labels[img_path]
-                self.targets.append(target)
-        elif self.mode == 'minitrain':
-            with open(self.root + 'noisy_train_key_list.txt', 'r') as f:
-                lines = f.read().splitlines()
-            n = len(lines)
-            np.random.seed(13)
-            subset_idx = np.random.choice(n, int(n/10), replace=False)
-            for i in subset_idx:
-                l = lines[i]
-                img_path = self.root + l
-                self.data.append(img_path)
-                target = self.noisy_labels[img_path]
-                self.targets.append(target)
-        elif self.mode == 'test':
-            with open(self.root + 'clean_test_key_list.txt', 'r') as f:
-                lines = f.read().splitlines()
-            for l in lines:
-                img_path = self.root + l
-                self.data.append(img_path)
-                target = self.clean_labels[img_path]
-                self.targets.append(target)
+        self.train_data, self.val_data, self.train_noisy_labels, self.val_noisy_labels, self.train_clean_labels, self.val_clean_labels = \
+            util.data_split(original_images, targets, new_labels, num_classes, split_percentage, seed)
+        if self.train:      
+            self.train_data = self.train_data.reshape((-1, 3, 224, 224))
+            self.train_data = self.train_data.transpose((0, 2, 3, 1))
+            print('building ham10000 train dataset')
+            print(self.train_data.shape)
+        
+        else:
+            self.val_data = self.val_data.reshape((-1, 3, 224, 224))
+            self.val_data = self.val_data.transpose((0, 2, 3, 1))
+            print('building ham10000 val dataset')
+            print(self.val_data.shape)
 
     def __getitem__(self, index):
-        img_path = self.data[index]
-        target = self.targets[index]
-        image = Image.open(img_path).convert('RGB')
-        img = self.transform(image)
-        return img, target
+           
+        if self.train:
+            img, noisy_label, clean_label = self.train_data[index], self.train_noisy_labels[index], self.train_clean_labels[index]
+            
+        else:
+            img, noisy_label, clean_label = self.val_data[index], self.val_noisy_labels[index], self.val_clean_labels[index]
+            
+        img = Image.fromarray(img)
+           
+        if self.transform is not None:
+            img = self.transform(img)
+            
+        if self.target_transform is not None:
+            noisy_label = self.target_transform(noisy_label)
+            clean_label = self.target_transform(clean_label)
+     
+        return img, noisy_label, clean_label, index
 
     def __len__(self):
-        return len(self.data)
+            
+        if self.train:
+            return len(self.train_data)
+        
+        else:
+            return len(self.val_data)
+        
+class ham10000_test_dataset(Data.Dataset):
+    def __init__(self, transform=None, target_transform=None):
+            
+        self.transform = transform
+        self.target_transform = target_transform
+           
+        self.test_data = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/test_images.npy', allow_pickle=True)
+        self.test_labels = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/test_labels.npy', allow_pickle=True)
+        self.test_data = self.test_data.reshape((1512,3,224,224))
+        self.test_data = self.test_data.transpose((0, 2, 3, 1))
 
+        print('building ham10000 test dataset')
+        print(self.test_data.shape)
+
+    def __getitem__(self, index):
+        
+        img, label = self.test_data[index], self.test_labels[index]
+        
+        img = Image.fromarray(img)
+        
+        if self.transform is not None:
+            img = self.transform(img)
+            
+        if self.target_transform is not None:
+            label = self.target_transform(label)
+     
+        return img, label, label, index
+    
+    def __len__(self):
+        return len(self.test_data)
+    
+class distilled_dataset(Data.Dataset):
+    def __init__(self, distilled_images, distilled_noisy_labels, distilled_pseudo_labels, transform=None, target_transform=None):
+        self.transform = transform
+        self.target_transform = target_transform
+        self.distilled_images = distilled_images
+        self.distilled_noisy_labels = distilled_noisy_labels
+        self.distilled_pseudo_labels = distilled_pseudo_labels
+
+    def __getitem__(self, index):
+        img, pseudo_label, noisy_label = self.distilled_images[index], self.distilled_pseudo_labels[index], self.distilled_noisy_labels[index]
+        img = Image.fromarray(img)
+        if self.transform is not None:
+            img = self.transform(img)
+        if self.target_transform is not None:
+            pseudo_label, noisy_label = self.target_transform(pseudo_label), self.target_transform(noisy_label)
+
+        return img, noisy_label, pseudo_label, index
+
+    def __len__(self):
+        return len(self.distilled_images)
+
+
+class local_dataset(Data.Dataset):
+    def __init__(self, local_data, local_noisy_labels, local_clean_labels, transform=None, target_transform=None):
+
+        self.transform = transform
+        self.target_transform = target_transform
+
+        self.local_data = local_data
+        self.local_noisy_labels = local_noisy_labels
+        self.local_clean_labels = local_clean_labels
+
+    def __getitem__(self, index):
+        img, noisy_label, clean_label = self.local_data[index], self.local_noisy_labels[index], \
+                                        self.local_clean_labels[index]
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            clean_label, noisy_label = self.target_transform(clean_label), self.target_transform(noisy_label)
+
+        return img, noisy_label, clean_label, index
+
+    def __len__(self):
+        return len(self.local_data)

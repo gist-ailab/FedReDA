@@ -1,49 +1,34 @@
-# python version 3.7.1
-# -*- coding: utf-8 -*-
-
 import argparse
 
 def args_parser():
     parser = argparse.ArgumentParser()
-    # federated arguments
-    parser.add_argument('--iteration1', type=int, default=5, help="enumerate iteration in preprocessing stage")
-    parser.add_argument('--rounds1', type=int, default=200, help="rounds of training in fine_tuning stage")
-    parser.add_argument('--rounds2', type=int, default=200, help="rounds of training in usual training stage")
-    parser.add_argument('--local_ep', type=int, default=5, help="number of local epochs")
-    parser.add_argument('--frac1', type=float, default=0.01, help="fration of selected clients in preprocessing stage")
-    parser.add_argument('--frac2', type=float, default=0.1, help="fration of selected clients in fine-tuning and usual training stage")
 
-    parser.add_argument('--num_users', type=int, default=100, help="number of uses: K")
-    parser.add_argument('--local_bs', type=int, default=10, help="local batch size: B")
-    parser.add_argument('--lr', type=float, default=0.03, help="learning rate")
-    parser.add_argument('--momentum', type=float, default=0.5, help="SGD momentum, default 0.5")
-    parser.add_argument('--beta', type=float, default=0, help="coefficient for local proximal，0 for fedavg, 1 for fedprox, 5 for noise fl")
-
-    # noise arguments
-    parser.add_argument('--LID_k', type=int, default=20, help="lid")
-    parser.add_argument('--level_n_system', type=float, default=0.4, help="fraction of noisy clients")
-    parser.add_argument('--level_n_lowerb', type=float, default=0.5, help="lower bound of noise level")
-
-    # correction
-    parser.add_argument('--relabel_ratio', type=float, default=0.5, help="proportion of relabeled samples among selected noisy samples")
-    parser.add_argument('--confidence_thres', type=float, default=0.5, help="threshold of model's confidence on each sample")
-    parser.add_argument('--clean_set_thres', type=float, default=0.1, help="threshold of estimated noise level to filter 'clean' set used in fine-tuning stage")
-
-    # ablation study
-    parser.add_argument('--fine_tuning', action='store_false', help='whether to include fine-tuning stage')
-    parser.add_argument('--correction', action='store_false', help='whether to correct noisy labels')
-
-    # other arguments
-    # parser.add_argument('--server', type=str, default='none', help="type of server")
-    parser.add_argument('--model', type=str, default='resnet18', help="model name")
-    parser.add_argument('--dataset', type=str, default='cifar10', help="name of dataset")
-    parser.add_argument('--pretrained', action='store_true', help="whether to use pre-trained model")
-    parser.add_argument('--iid', action='store_true', help="i.i.d. or non-i.i.d.")
-    parser.add_argument('--non_iid_prob_class', type=float, default=0.7, help="non iid sampling prob for class")
-    parser.add_argument('--alpha_dirichlet', type=float, default=10)
-    parser.add_argument('--num_classes', type=int, default=10, help="number of classes")
-    parser.add_argument('--seed', type=int, default=13, help="random seed, default: 1")
-    parser.add_argument('--mixup', action='store_true')
-    parser.add_argument('--alpha', type=float, default=1, help="0.1,1,5")
+    parser.add_argument('--num_exp', type=int, default=1, help='number of experiments')
+    parser.add_argument('--print_txt', type=bool, default=True, help='print txt')
+    parser.add_argument('--num_classes', type=int, default=7, help='number of classes')
+    parser.add_argument('--lr_w', type=float, default=0.01, help='learning rate for warming up')
+    parser.add_argument('--lr', type=float, default=0.01, help='learning rate for training')
+    parser.add_argument('--lr_f', type=float, default=1e-3, help='learning rate for fine-tuning')
+    parser.add_argument('--result_dir', type=str, help='dir to save result txt files', default='results')
+    parser.add_argument('--noise_rate', type=float, help='overall corruption rate', default=0.2)
+    parser.add_argument('--dataset', type=str, help='ham10000, aptos', default='ham10000')
+    parser.add_argument('--round1', type=int, help='number of rounds for warming up', default=5)
+    parser.add_argument('--round2', type=int, help='number of rounds for training transition matrix estimation', default=50)
+    parser.add_argument('--round3', type=int, help='number of rounds for fine-tuning', default=100)
+    parser.add_argument('--local_ep', type=int, help='number of local epochs', default=1)
+    parser.add_argument('--local_ep2', type=int, help='number of local epochs', default=1)
+    parser.add_argument('--seed', type=int, default=41)
+    parser.add_argument('--print_freq', type=int, default=5)
+    parser.add_argument('--num_workers', type=int, help='how many subprocesses to use for data loading', default=16)
+    parser.add_argument('--gpu', type=int, help='ind of gpu', default=1)
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--momentum', type=int, help='momentum', default=0.9)
+    parser.add_argument('--batch_size', type=int, help='batch_size', default=16)
+    parser.add_argument('--split_percentage', type=float, help = 'train and validation', default=0.90)
+    parser.add_argument('--tau', type=float, help='threshold', default=0.5)
+    parser.add_argument('--mu', type=float, help='threshold', default=0.01)
+    parser.add_argument('--num_clients', type=int, help = 'number of total clients', default=5)
+    parser.add_argument('--frac', type=float, default=1.0, help="fraction of selected clients")
+    parser.add_argument('--iid', type=bool, help='i.i.d. or non-i.i.d.', default=True)
 
     return parser.parse_args()

@@ -177,3 +177,5 @@ cython_debug/
 *.txt
 *.csv
 *.pth
+*.zip
+*.npy

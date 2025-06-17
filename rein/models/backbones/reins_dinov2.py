@@ -33,7 +33,6 @@ class ReinsDinoVisionTransformer(DinoVisionTransformer):
         set_requires_grad(self, ["reins", "linear"])
         set_train(self, ["reins", "linear"])
 
-
 class DualReinsDinoVisionTransformer(DinoVisionTransformer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -86,7 +85,6 @@ class DualReinsDinoVisionTransformer(DinoVisionTransformer):
         set_requires_grad(self, ["reins1", "reins2", "linear"])
         set_train(self, ["reins1", "reins2", "linear"])
 
-
 class LoRAFusedDualReinsDinoVisionTransformer(DinoVisionTransformer):
     def __init__(self, fusion_alpha=0.5, **kwargs):
         super().__init__(**kwargs)
@@ -130,7 +128,38 @@ class LoRAFusedDualReinsDinoVisionTransformer(DinoVisionTransformer):
             delta1 = self.reins1.forward_delta_only(x, idx, batch_first=True, has_cls_token=True)
             delta2 = self.reins2.forward_delta_only(x, idx, batch_first=True, has_cls_token=True)
             x = x + self.fusion_alpha * delta1 + (1 - self.fusion_alpha) * delta2
+            # x = x + delta1 + delta2
         return x
+    
+    def forward_features1_wfeats(self, x, masks=None):
+        features = []
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            x = self.reins1.forward(x, idx, batch_first=True, has_cls_token=True)
+            features.append(x)
+        return features
+
+    def forward_features2_wfeats(self, x, masks=None):
+        features = []
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            x = self.reins2.forward(x, idx, batch_first=True, has_cls_token=True)
+            features.append(x)
+        return features
+    
+    def forward_fused_features_wfeats(self, x, masks=None):
+        features = []
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            delta1 = self.reins1.forward_delta_only(x, idx, batch_first=True, has_cls_token=True)
+            delta2 = self.reins2.forward_delta_only(x, idx, batch_first=True, has_cls_token=True)
+            x = x + self.fusion_alpha * delta1 + (1 - self.fusion_alpha) * delta2
+            # x = x + delta1 + delta2
+            features.append(x)
+        return features
 
     def forward_features_no_rein(self, x, masks=None):
         x = self.prepare_tokens_with_masks(x, masks)
@@ -155,3 +184,4 @@ class LoRAFusedDualReinsDinoVisionTransformer(DinoVisionTransformer):
             return super().train(mode)
         set_requires_grad(self, ["reins1", "reins2", "linear"])
         set_train(self, ["reins1", "reins2", "linear"])
+
