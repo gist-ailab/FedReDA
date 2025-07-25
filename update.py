@@ -4,6 +4,68 @@ import torch
 import copy
 from collections import defaultdict
 import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from torch import nn, autograd
+from sklearn.metrics import balanced_accuracy_score
+from geomloss import SamplesLoss
+
+def cross_entropy_soft_label(pred_logits, soft_targets, reduction='none'):
+    """
+    Cross Entropy loss that supports soft targets.
+
+    Args:
+        pred_logits (Tensor): (B, C) logits output from the model (before softmax).
+        soft_targets (Tensor): (B, C) soft labels (e.g. with label smoothing).
+        reduction (str): 'none' | 'mean' | 'sum'
+    
+    Returns:
+        loss (Tensor)
+    """
+    log_probs = F.log_softmax(pred_logits, dim=1)
+    loss = -torch.sum(soft_targets * log_probs, dim=1)  # shape: (B,)
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss  # no reduction
+
+def get_local_update_objects(args, dataset_train, dict_users=None, net_glob=None):
+    local_update_objects = []
+    for idx in range(args.num_clients):
+        local_update_args = dict(
+            args=args,
+            user_idx=idx,
+            dataset=dataset_train,
+            idxs=dict_users[idx],
+        )
+        local_update_objects.append(LocalUpdateRFL(**local_update_args))
+
+    return local_update_objects
+
+def FedAvg(w):
+    w_avg = copy.deepcopy(w[0])
+    for k in w_avg.keys():
+        for i in range(1, len(w)):
+            w_avg[k] += w[i][k]
+        w_avg[k] = torch.div(w_avg[k], len(w))
+            
+    return w_avg
+
+class DatasetSplitRFL(Dataset):
+    def __init__(self, dataset, idxs):
+        self.dataset = dataset
+        self.idxs = list(idxs)
+        
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, item):
+        item = int(item)
+        image, label, _, _ = self.dataset[self.idxs[item]]
+
+        return image, label, self.idxs[item]
 
 def accuracy(logit, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -24,12 +86,12 @@ def accuracy(logit, target, topk=(1,)):
 
 
 # Train the Model
-def train_one_step(net, data, label, optimizer, criterion):
+def train_one_step(net, data, label, optimizer, criterion, class_p_list=None):
     net.train()
     pred = net(data)
-    # print(label)
-    # print(type(label))
-    loss = criterion(pred, label)
+    if class_p_list is not None:
+        pred = pred + 0.5*class_p_list
+    loss = criterion(pred, label).mean()
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
@@ -39,8 +101,7 @@ def train_one_step(net, data, label, optimizer, criterion):
     return float(acc[0]), loss
 
 
-def train(train_loader, epoch, model, optimizer1, args):
-    # print('Training %s...' % model_str)
+def train(train_loader, epoch, model, optimizer1, criterion, args, class_p_list=None):
     model.train()
     train_total = 0
     train_correct = 0
@@ -49,11 +110,11 @@ def train(train_loader, epoch, model, optimizer1, args):
 
         data = data.cuda()
         labels = noisy_label.cuda()
-        prec, loss = train_one_step(model, data, labels, optimizer1, nn.CrossEntropyLoss())
+        prec, loss = train_one_step(model, data, labels, optimizer1, criterion, class_p_list)
         train_total += 1
         train_correct += prec
 
-        if (i+1)==len(enumerate(train_loader)):
+        if (i+1)==250:
             print('Epoch [%d], Iter [%d/%d] Training Accuracy1: %.4F, Loss1: %.4f'
                     % (epoch + 1, i + 1, 4000 // args.batch_size, prec, loss.item()))
 
@@ -61,8 +122,7 @@ def train(train_loader, epoch, model, optimizer1, args):
 
     return train_acc
 
-
-def train_prox(train_loader, epoch, model, global_model, optimizer1, mu, args):
+def train_prox(train_loader, epoch, model, global_model, optimizer1, mu, args, class_p_list=None):
     # print('Training %s...' % model_str)
     model.train()
     train_total = 0
@@ -72,7 +132,7 @@ def train_prox(train_loader, epoch, model, global_model, optimizer1, mu, args):
 
         data = data.cuda()
         labels = noisy_label.cuda()
-        prec, loss = train_prox_one_step(model, global_model, data, labels, optimizer1, nn.CrossEntropyLoss(), mu)
+        prec, loss = train_prox_one_step(model, global_model, data, labels, optimizer1, nn.CrossEntropyLoss(), mu, class_p_list)
         train_total += 1
         train_correct += prec
 
@@ -84,10 +144,11 @@ def train_prox(train_loader, epoch, model, global_model, optimizer1, mu, args):
 
     return train_acc
 
-
-def train_prox_one_step(net, global_model, data, label, optimizer, criterion, mu):
+def train_prox_one_step(net, global_model, data, label, optimizer, criterion, mu, class_p_list=None):
     net.train()
     pred = net(data)
+    if class_p_list is not None:
+        pred = pred + 0.5*class_p_list
     # compute proximal_term
     proximal_term = 0.0
     for w, w_t in zip(net.parameters(), global_model.parameters()):
@@ -108,6 +169,8 @@ def evaluate(val_loader, model1):
     model1.eval()  # Change model to 'eval' mode.
     correct1 = 0
     total1 = 0
+    all_preds = []
+    all_targets = []
     with torch.no_grad():
         for data, noisy_label, clean_label, _ in val_loader:
             data = data.cuda()
@@ -115,11 +178,15 @@ def evaluate(val_loader, model1):
             outputs1 = F.softmax(logits1, dim=1)
             _, pred1 = torch.max(outputs1.data, 1)
             total1 += noisy_label.size(0)
-            correct1 += (pred1.cpu() == clean_label.long()).sum()
+            
+            all_preds.extend(pred1.cpu().numpy())
+            all_targets.extend(clean_label.cpu().numpy())
+            
+        #     correct1 += (pred1.cpu() == clean_label.long()).sum()
+        # acc1 = 100 * float(correct1) / float(total1)
+        balanced_acc = balanced_accuracy_score(all_targets, all_preds)
 
-        acc1 = 100 * float(correct1) / float(total1)
-
-    return acc1
+    return balanced_acc*100
 
 
 def train_forward(model, train_loader, optimizer, model_trans):
@@ -146,7 +213,6 @@ def train_forward(model, train_loader, optimizer, model_trans):
 
     train_acc = float(train_correct) / float(train_total)
     return train_acc
-
 
 def average_weights(w):
     """
@@ -178,6 +244,192 @@ def average_weights_weighted(w, dataset_list):
     return w_avg
 
 #########################################################################
+def compute_transport_matrix(W1, W2, epsilon=0.01):
+    """
+    W1: [out_dim, in_dim] - global adapter weight
+    W2: [out_dim, in_dim] - client adapter weight
+    Returns:
+        T: [out_dim, out_dim] transport matrix aligning W2 to W1
+    """
+    out_dim = W1.size(0)
+
+    # Compute pairwise cosine distance as cost matrix
+    cost_matrix = 1 - F.cosine_similarity(W1.unsqueeze(1), W2.unsqueeze(0), dim=-1)  # shape: [out_dim, out_dim]
+
+    # OT using Sinkhorn distance
+    # Assume uniform marginals
+    a = torch.ones(out_dim, device=W1.device) / out_dim
+    b = torch.ones(out_dim, device=W2.device) / out_dim
+
+    # Use geomloss Sinkhorn
+    sinkhorn = SamplesLoss(loss="sinkhorn", p=2, blur=epsilon)
+    loss = sinkhorn(a, W1, b, W2)  # returns scalar but internally computes T
+
+    # Geomloss doesn't return T directly, so alternatively, use custom Sinkhorn if explicit T is needed
+    # For now, as an example, we'll just use the cost matrix to form T via softmin:
+    T = F.softmax(-cost_matrix / epsilon, dim=-1)  # Soft alignment approximation
+
+    return T
+
+def average_reins(global_model, client_models):
+    # 1. Average entire reins
+    with torch.no_grad():
+        # 모든 client의 reins파라미터 가져오기
+        reins_named_params = {}
+        for name, _ in client_models[0].reins.named_parameters():
+            stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_models])
+            reins_named_params[name] = stacked.mean(dim=0)
+
+        # global_model.reins에 복사
+        for name, param in global_model.reins.named_parameters():
+            if name in reins_named_params:
+                param.data.copy_(reins_named_params[name])
+                
+        reins_named_params2 = {}
+        for name, _ in client_models[0].reins2.named_parameters():
+            stacked = torch.stack([dict(client.reins2.named_parameters())[name].data for client in client_models])
+            reins_named_params2[name] = stacked.mean(dim=0)
+
+        # global_model.reins에 복사
+        for name, param in global_model.reins2.named_parameters():
+            if name in reins_named_params2:
+                param.data.copy_(reins_named_params2[name])
+
+    # 2. Average linear_rein weights and biases
+    weight_sum = sum(client.linear_rein.weight.data for client in client_models)
+    bias_sum = sum(client.linear_rein.bias.data for client in client_models)
+    global_model.linear_rein.weight.data.copy_(weight_sum / len(client_models))
+    global_model.linear_rein.bias.data.copy_(bias_sum / len(client_models))
+    
+    weight_sum = sum(client.linear_rein2.weight.data for client in client_models)
+    bias_sum = sum(client.linear_rein2.bias.data for client in client_models)
+    global_model.linear_rein2.weight.data.copy_(weight_sum / len(client_models))
+    global_model.linear_rein2.bias.data.copy_(bias_sum / len(client_models))
+    
+    # 2-2. Average linear_norein weights and biases
+    weight_sum = sum(client.linear_norein.weight.data for client in client_models)
+    bias_sum = sum(client.linear_norein.bias.data for client in client_models)
+    global_model.linear_norein.weight.data.copy_(weight_sum / len(client_models))
+    global_model.linear_norein.bias.data.copy_(bias_sum / len(client_models))
+
+    # 3. Broadcast updated global reins → 각 client.reins에 전달
+    for client in client_models:
+        client.reins.load_state_dict(global_model.reins.state_dict())
+        client.reins2.load_state_dict(global_model.reins2.state_dict())
+        client.linear_rein.load_state_dict(global_model.linear_rein.state_dict())
+        client.linear_rein2.load_state_dict(global_model.linear_rein2.state_dict())
+        client.linear_norein.load_state_dict(global_model.linear_norein.state_dict())
+        # client.linear_rein.load_state_dict(global_model.linear_rein.state_dict())
+        client.reins.train()
+
+def PAPA_average_reins(global_model, client_models, alpha_papa=0.9):
+    with torch.no_grad():
+        # 1. Average reins across clients → global model 업데이트
+        reins_named_params = {}
+        for name, _ in client_models[0].reins.named_parameters():
+            stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_models])
+            reins_named_params[name] = stacked.mean(dim=0)
+
+        for name, param in global_model.reins.named_parameters():
+            if name in reins_named_params:
+                param.data.copy_(reins_named_params[name])
+
+        reins_named_params2 = {}
+        for name, _ in client_models[0].reins2.named_parameters():
+            stacked = torch.stack([dict(client.reins2.named_parameters())[name].data for client in client_models])
+            reins_named_params2[name] = stacked.mean(dim=0)
+
+        for name, param in global_model.reins2.named_parameters():
+            if name in reins_named_params2:
+                param.data.copy_(reins_named_params2[name])
+
+        # 2. Average linear layers
+        def average_linear(client_params):
+            return sum(client_param.data for client_param in client_params) / len(client_params)
+
+        global_model.linear_rein.weight.data.copy_(average_linear([client.linear_rein.weight for client in client_models]))
+        global_model.linear_rein.bias.data.copy_(average_linear([client.linear_rein.bias for client in client_models]))
+
+        global_model.linear_rein2.weight.data.copy_(average_linear([client.linear_rein2.weight for client in client_models]))
+        global_model.linear_rein2.bias.data.copy_(average_linear([client.linear_rein2.bias for client in client_models]))
+
+        global_model.linear_norein.weight.data.copy_(average_linear([client.linear_norein.weight for client in client_models]))
+        global_model.linear_norein.bias.data.copy_(average_linear([client.linear_norein.bias for client in client_models]))
+
+    # 3. Broadcast global → client with EMA update
+    for client in client_models:
+        for name, param in client.reins.named_parameters():
+            global_param = dict(global_model.reins.named_parameters())[name]
+            param.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_param.data)
+
+        for name, param in client.reins2.named_parameters():
+            global_param = dict(global_model.reins2.named_parameters())[name]
+            param.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_param.data)
+
+        client.linear_rein.weight.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_model.linear_rein.weight.data)
+        client.linear_rein.bias.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_model.linear_rein.bias.data)
+
+        client.linear_rein2.weight.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_model.linear_rein2.weight.data)
+        client.linear_rein2.bias.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_model.linear_rein2.bias.data)
+
+        client.linear_norein.weight.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_model.linear_norein.weight.data)
+        client.linear_norein.bias.data.mul_(alpha_papa).add_((1 - alpha_papa) * global_model.linear_norein.bias.data)
+
+        client.train()
+
+def average_reins_with_transport(global_model, client_models):
+    with torch.no_grad():
+        # 1. Align and average reins
+        for name, param in global_model.reins.named_parameters():
+            aligned_params = []
+            for client in client_models:
+                client_param = dict(client.reins.named_parameters())[name].data
+                global_param = param.data
+
+                if len(client_param.shape) == 2:  # Only align weights of shape [out_dim, in_dim]
+                    T = compute_transport_matrix(global_param, client_param)
+                    aligned_client_param = torch.matmul(T, client_param)
+                else:
+                    aligned_client_param = client_param  # e.g., biases are just copied
+
+                aligned_params.append(aligned_client_param)
+
+            param.data.copy_(torch.stack(aligned_params).mean(dim=0))
+
+        # 동일하게 reins2
+        for name, param in global_model.reins2.named_parameters():
+            aligned_params = []
+            for client in client_models:
+                client_param = dict(client.reins2.named_parameters())[name].data
+                global_param = param.data
+
+                if len(client_param.shape) == 2:
+                    T = compute_transport_matrix(global_param, client_param)
+                    aligned_client_param = torch.matmul(T, client_param)
+                else:
+                    aligned_client_param = client_param
+
+                aligned_params.append(aligned_client_param)
+
+            param.data.copy_(torch.stack(aligned_params).mean(dim=0))
+
+        # 2. Average linear layers
+        for layer_name in ['linear_rein', 'linear_rein2', 'linear_norein']:
+            weight_sum = sum(getattr(client, layer_name).weight.data for client in client_models)
+            bias_sum = sum(getattr(client, layer_name).bias.data for client in client_models)
+
+            getattr(global_model, layer_name).weight.data.copy_(weight_sum / len(client_models))
+            getattr(global_model, layer_name).bias.data.copy_(bias_sum / len(client_models))
+
+        # 3. Broadcast
+        for client in client_models:
+            client.reins.load_state_dict(global_model.reins.state_dict())
+            client.reins2.load_state_dict(global_model.reins2.state_dict())
+            client.linear_rein.load_state_dict(global_model.linear_rein.state_dict())
+            client.linear_rein2.load_state_dict(global_model.linear_rein2.state_dict())
+            client.linear_norein.load_state_dict(global_model.linear_norein.state_dict())
+
+            client.reins.train()
 
 def average_reins1(global_model, client_models):
     # 1. Average entire reins1 (not just learnable_tokens)
@@ -229,302 +481,522 @@ def average_reins2(global_model, client_models):
     # 3. Broadcast updated global reins → 각 client.reins2에 전달
     for client in client_models:
         client.reins2.load_state_dict(global_model.reins.state_dict())
-        for p in client.reins2.parameters():
-            p.requires_grad = True
         client.reins2.train()
-
-
-def client_update_with_refinement(client_model, global_model, optimizer, loader, config, mix_ratio):
-    """
-    FedDAT-style two-step optimization with diagnostics:
-    Step 1: Tune A^s (shared adapter) to match (A^c + A^s)-based fused features and refined labels.
-    Step 2: Tune A^c (client adapter) to match improved A^s predictions and refined labels.
-    """
-    import copy
-    import numpy as np
-    import torch.nn.functional as F
-
-    T = config['kd_temperature']
-    lambda_kd = config['kd_lambda']
-    mkd_lambda = config['mkd_lambda']
-    num_classes = config['num_classes']
-    device = config['device']
-
-    # ----------- Step 1: Tune A^s only ----------- #
-    fused_model = copy.deepcopy(client_model)
-    fused_model.eval()
-
-    client_model.eval()
-    client_model.train2()
-
-    mse_vals, ce_vals, clean_ratios_1 = [], [], []
-    correct1, total1 = 0, 0
-
-    for inputs, targets, _, _ in loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        with torch.no_grad():
-            fused_feats = fused_model.forward_fused_features(inputs)[:, 0, :]
-            softmax_fused = F.softmax(
-                fused_model.linear_rein(fused_feats), dim=1
-            )
-            pred_global = softmax_fused.argmax(dim=1)
-            # soft_targets = mix_ratio * F.one_hot(targets, num_classes=num_classes).float() + (1 - mix_ratio) * softmax_fused
-            # refined_labels = soft_targets.argmax(dim=1) 
-
-        feats2 = client_model.forward_features2(inputs)[:, 0, :]
-        logits2 = client_model.linear_rein(feats2)
-        pred2 = logits2.argmax(dim=1)
-        # linear_accurate = (pred_global == refined_labels)
-        linear_accurate = (pred_global == targets) 
-
-        loss_mse = F.mse_loss(feats2, fused_feats)
-        # ce = F.cross_entropy(logits2, refined_labels, reduction='none')
-        ce = F.cross_entropy(logits2, targets, reduction='none')
-        loss_ce = (linear_accurate * ce).mean()
-        loss_ls = 0.005*loss_mse + loss_ce
-
-        mse_vals.append(0.005*loss_mse.item())
-        ce_vals.append(loss_ce.item())
-        clean_ratios_1.append(linear_accurate.float().mean().item())
-        # correct1 += (pred2 == refined_labels).sum().item()
-        correct1 += (pred2 == targets).sum().item()
-        # total1 += refined_labels.size(0)
-        total1 += targets.size(0)
-
-        optimizer.zero_grad()
-        loss_ls.backward()
-        optimizer.step()
-
-    train_acc1 = 100. * correct1 / total1
-    print(f"[Step1] Avg MSE: {np.mean(mse_vals):.4f}, Avg CE: {np.mean(ce_vals):.4f}, "
-          f"Clean Match: {np.mean(clean_ratios_1)*100:.2f}%, Train Acc: {train_acc1:.2f}%")
-
-    # ----------- Average A^s into global model ----------- #
-    average_reins2(client_model, global_model)
-    print("[Averaging] Shared adapter (A^s) has been merged into global model.")
-
-    # ----------- Step 2: Tune A^c only ----------- #
-    client_model.eval()
-    client_model.train1()
-
-    ce_vals, kd_vals, mkd_vals, clean_ratios_2 = [], [], [], []
-    correct2, total2 = 0, 0
-
-    for inputs, targets, _, _ in loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        with torch.no_grad():
-            global_model.eval()
-            softmax_global = F.softmax(global_model.linear_rein(global_model.forward_features(inputs)[:, 0, :]), dim=1)
-            pred_global = softmax_global.argmax(dim=1)
-            # soft_targets = mix_ratio * F.one_hot(targets, num_classes=num_classes).float() + (1 - mix_ratio) * softmax_global
-            # refined_labels = soft_targets.argmax(dim=1)
-
-        feats_fused = client_model.forward_fused_features(inputs)[:, 0, :]
-        logits_fused = client_model.linear_rein(feats_fused)
-        pred_fused = logits_fused.argmax(dim=1)
-        # linear_accurate = (pred_global == refined_labels)
-        linear_accurate = (pred_global == targets)
-
-        feats2 = client_model.forward_features2(inputs)[:, 0, :].detach()
-        logits2 = client_model.linear_rein(feats2)
-
-        # ce = F.cross_entropy(logits_fused, refined_labels, reduction='none')
-        ce = F.cross_entropy(logits_fused, targets, reduction='none')
-        kd = F.kl_div(
-            F.log_softmax(logits_fused / T, dim=1),
-            F.softmax(logits2 / T, dim=1),
-            reduction='none'
-        ).sum(dim=1) * (T * T)
-        loss_ac = (linear_accurate * (ce + lambda_kd * kd)).mean()
-
-        logits2_upd = client_model.linear_rein(feats2)
-        loss_mkd = F.kl_div(
-            F.log_softmax(logits2_upd / T, dim=1),
-            F.softmax(logits_fused.detach() / T, dim=1),
-            reduction='batchmean'
-        ) * (T * T)
-
-        ce_vals.append(ce.mean().item())
-        kd_vals.append(kd.mean().item())
-        mkd_vals.append(loss_mkd.item())
-        clean_ratios_2.append(linear_accurate.float().mean().item())
-        # correct2 += (pred_fused == refined_labels).sum().item()
-        # total2 += refined_labels.size(0)
-        correct2 += (pred_fused == targets).sum().item()
-        total2 += targets.size(0)
-
-        loss = loss_ac + mkd_lambda * loss_mkd
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    train_acc2 = 100. * correct2 / total2
-    print(f"[Step2] CE: {np.mean(ce_vals):.4f}, KD: {np.mean(kd_vals):.4f}, MKD: {np.mean(mkd_vals):.4f}, "
-          f"Clean Match: {np.mean(clean_ratios_2)*100:.2f}%, Train Acc: {train_acc2:.2f}%")
-    
-def client_update_step1(client_model, optimizer, loader, config, mix_ratio):
-    num_classes = config['num_classes']
-    device = config['device']
-
-    fused_model = copy.deepcopy(client_model)
-    fused_model.eval()
-
-    client_model.eval()
-    client_model.train2()
-
-    mse_vals, ce_vals, clean_ratios_1 = [], [], []
-    correct1, total1 = 0, 0
-
-    class_correct = defaultdict(int)
-    class_total = defaultdict(int)
-
-    for inputs, targets, _, _ in loader:
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        with torch.no_grad():
-            # fused_feats = fused_model.forward_fused_features(inputs)[:, 0, :]
-            fused_feats_list = fused_model.forward_fused_features_wfeats(inputs)
-            fused_feats = fused_feats_list[-1][:, 0, :]
-            softmax_fused = F.softmax(fused_model.linear_rein(fused_feats), dim=1)
-            pred_global = softmax_fused.argmax(dim=1)
-            # soft_targets = mix_ratio * F.one_hot(targets, num_classes=num_classes).float() + (1 - mix_ratio) * softmax_fused
-            # refined_labels = soft_targets.argmax(dim=1)
-
-        # feats2 = client_model.forward_features2(inputs)[:, 0, :]
-        feats2_list = client_model.forward_features2_wfeats(inputs)
-        feats2 = feats2_list[-1][:, 0, :]
-        logits2 = client_model.linear_rein(feats2)
-        pred2 = logits2.argmax(dim=1)
-        linear_accurate = (pred_global == targets)
-        # mask_weight = 0.1 + 0.9 * linear_accurate.float()
-        mask_weight = mix_ratio + (1-mix_ratio) * linear_accurate.float() 
         
-        # loss_mse = (mask_weight.unsqueeze(1)*F.mse_loss(feats2, fused_feats, reduction='none')).mean()
-        loss_mse = 0
-        for f_fused, f_client in zip(fused_feats_list, feats2_list):
-            loss_mse += F.mse_loss(f_client, f_fused, reduction='none').mean()
-        loss_ce = (mask_weight*F.cross_entropy(logits2, targets, reduction='none')).mean()
+def average_reins2_ema(global_model, client_models, alpha=0.95):
+    """
+    Update global_model using EMA of client models.
+    alpha: decay factor for EMA. Higher = more weight on previous global_model.
+    """
+    with torch.no_grad():
+        # EMA for reins2 (adapter parameters)
+        for name, param in global_model.reins.named_parameters():
+            if name in dict(client_models[0].reins2.named_parameters()):
+                client_param_stack = torch.stack([
+                    dict(client.reins2.named_parameters())[name].data
+                    for client in client_models
+                ])
+                mean_param = client_param_stack.mean(dim=0)
+                # EMA update
+                param.data.mul_(alpha).add_((1 - alpha) * mean_param)
 
-        loss_mse = F.mse_loss(feats2, fused_feats, reduction='none').mean()
-        # loss_ce = F.cross_entropy(logits2, targets, reduction='none').mean()
+        # EMA for linear_rein layer
+        weight_avg = sum(client.linear_rein.weight.data for client in client_models) / len(client_models)
+        bias_avg = sum(client.linear_rein.bias.data for client in client_models) / len(client_models)
 
-        # loss_ls = loss_ce
-        loss_ls = 5*loss_mse+loss_ce
-        # loss_ls = loss_mse+10*loss_ce
+        global_model.linear_rein.weight.data.mul_(alpha).add_((1 - alpha) * weight_avg)
+        global_model.linear_rein.bias.data.mul_(alpha).add_((1 - alpha) * bias_avg)
+        
+        # EMA for linear_rein layer
+        weight_avg = sum(client.linear_norein.weight.data for client in client_models) / len(client_models)
+        bias_avg = sum(client.linear_norein.bias.data for client in client_models) / len(client_models)
 
-        mse_vals.append(5*loss_mse.item())
-        ce_vals.append(loss_ce.item())
-        clean_ratios_1.append(linear_accurate.float().mean().item())
-        correct1 += (pred2 == targets).sum().item()
+
+def client_update_with_refinement(client_model, global_model, optimizers, loader, config, mix_ratio, class_total, class_p_list=None, dynamic_boost=None):
+    num_classes = config['num_classes']
+    device = config['device']
+
+    client_model.eval()
+    client_model.train()
+
+    optimizer_rein, optimizer_rein2 = optimizers
+
+    if isinstance(class_total, dict):
+        class_total_tensor = torch.tensor(
+            [class_total.get(i, 0) for i in range(num_classes)],
+            dtype=torch.float,
+            device=device
+        )
+    else:
+        class_total_tensor = torch.tensor(class_total).to(device).float()
+    class_weights = F.softmax(class_total_tensor, dim=0)
+    class_adjustment = 1.0 - class_weights
+
+    ce_norein_vals, ce_vals, clean_ratios = [], [], []
+    correct1, total1 = 0, 0
+    class_correct_norein = defaultdict(int)
+    class_correct_rein = defaultdict(int)
+    class_correct = defaultdict(int)
+    class_noise_correct_norein = defaultdict(int)
+    class_noise_correct_rein = defaultdict(int)
+    class_noise_correct = defaultdict(int)
+    
+    class_total = defaultdict(int)
+    class_noise_correct = defaultdict(int)
+    class_noise_total = defaultdict(int)
+
+    # === Clean detection evaluation metrics ===
+    detected_clean_total = 0
+    true_clean_total = 0
+    correct_detected_clean_total = 0
+    false_detected_clean_total = 0
+    missed_clean_total = 0
+    
+    for inputs, targets, clean_targets, _ in loader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        clean_targets = clean_targets.to(device)
+
+        # === Guide model ===
+        with torch.no_grad():
+            feats_global = global_model.forward_features(inputs)[:, 0, :]
+            logits_global = global_model.linear_rein(feats_global)
+            pred_global = logits_global.argmax(dim=1)
+            
+            # feats_global = global_model.forward_features2(inputs)[:, 0, :]
+            # logits_global = global_model.linear_rein2(feats_global)
+            # pred_global = logits_global.argmax(dim=1)
+
+        # === Client model ===
+        feats_rein = client_model.forward_features(inputs)[:, 0, :]
+        logits_rein = client_model.linear_rein(feats_rein)
+        pred_rein = logits_rein.argmax(dim=1)
+        
+        feats_rein2 = client_model.forward_features2(inputs)[:, 0, :]
+        logits_rein2 = client_model.linear_rein2(feats_rein2)
+        pred_rein2 = logits_rein2.argmax(dim=1)
+
+        # === Soft label construction ===
+        with torch.no_grad():
+            targets_refine = targets
+            targets_refine_dist = targets
+            # targets_refine = mix_ratio * F.one_hot(targets, num_classes=config['num_classes']).to(targets.device)\
+            #     + (1-mix_ratio)*F.softmax(logits_global, dim=1)
+            
+            # targets_refine_dist = F.softmax(targets_refine, dim=-1)
+            # targets_refine = targets_refine.max(1).indices
+
+            linear_accurate_global_rein = (pred_global == targets_refine)
+            linear_accurate = (pred_rein == targets_refine)
+
+            # === Clean detection statistics ===
+            is_actually_clean = (targets_refine == clean_targets)
+            total_clean = is_actually_clean.sum().item()
+            correct_detected_clean = (linear_accurate & is_actually_clean).sum().item()
+            false_detected_clean = (linear_accurate & ~is_actually_clean).sum().item()
+            missed_clean = (~linear_accurate & is_actually_clean).sum().item()
+
+            detected_clean_total += linear_accurate.sum().item()
+            true_clean_total += total_clean
+            correct_detected_clean_total += correct_detected_clean
+            false_detected_clean_total += false_detected_clean
+            missed_clean_total += missed_clean
+
+        for i in range(targets.size(0)):
+            # if linear_accurate[i]:  # linear accurate 조건을 만족한 경우만 카운트
+            label = clean_targets[i].item()
+            noise_label = targets_refine[i].item()
+            pred_label_rein = pred_rein[i].item()
+            pred_label = pred_rein2[i].item()
+            class_total[label] += 1
+            class_noise_total[noise_label] += 1
+            if label == pred_label:
+                class_correct[label] += 1
+            if label == pred_label_rein:
+                class_correct_rein[label] += 1
+            if noise_label == pred_label:
+                class_noise_correct[noise_label] += 1
+            if noise_label == pred_label_rein:
+                class_noise_correct_rein[noise_label] += 1
+        
+        if class_p_list is not None:
+            # logits_rein = logits_rein + 0.5 * class_p_list
+            # logits_rein2 = logits_rein2 + 0.5 * class_p_list
+            
+            # logits_rein = logits_rein + 1. * class_p_list + 0.1 * dynamic_boost
+            # logits_rein2 = logits_rein2 + 1. * class_p_list + 0.1 * dynamic_boost
+            
+            logits_rein = logits_rein + 0.5 * dynamic_boost
+            logits_rein2 = logits_rein2 + 0.5 * dynamic_boost
+        
+        loss_ce = F.cross_entropy(logits_rein, targets_refine, reduction='none')
+        loss_ce2 = F.cross_entropy(logits_rein2, targets_refine, reduction='none')
+
+        # loss_ce = cross_entropy_soft_label(logits_rein, targets_refine_dist, reduction='none')
+        # loss_ce2 = cross_entropy_soft_label(logits_rein2, targets_refine_dist, reduction='none')
+        
+        # loss_ls = (linear_accurate*loss_ce2).mean()+(linear_accurate_norein*loss_ce).mean() + loss_ce_norein.mean()
+        # loss_ls = (linear_accurate*loss_ce2).mean()+(linear_accurate_norein*loss_ce).mean() + loss_ce_norein.mean()+\
+        #             (linear_accurate_global_rein*loss_ce2).mean()+(linear_accurate_global_norein*loss_ce).mean()   
+        loss_ls = (linear_accurate_global_rein*loss_ce2).mean()+loss_ce.mean()
+        # loss_ls = (linear_accurate*loss_ce).mean()
+
+        optimizer_rein.zero_grad()
+        optimizer_rein2.zero_grad()
+
+        loss_ls.backward()
+        optimizer_rein.step()
+        optimizer_rein2.step()
+
+        # === Stats ===
+        ce_vals.append((linear_accurate*loss_ce).mean().item())
+        
+        clean_ratios.append(linear_accurate.float().mean().item())
+        correct1 += (pred_rein2 == targets_refine).sum().item()
         total1 += targets.size(0)
 
-        for t, p in zip(targets, pred2):
-            class_total[t.item()] += 1
-            if t.item() == p.item():
-                class_correct[t.item()] += 1
-
-        optimizer.zero_grad()
-        loss_ls.backward()
-        optimizer.step()
-
+    for cls in range(num_classes):
+        if class_noise_total[cls] > 0:
+            acc = class_noise_correct[cls] / class_noise_total[cls]
+        else:
+            acc = 0.0
+        dynamic_boost[cls] = (acc) ** 2
+    dynamic_boost = dynamic_boost / dynamic_boost.sum()
+    dynamic_boost = torch.log(dynamic_boost+1e-6)
+    
     train_acc1 = 100. * correct1 / total1
-    print(f"\n[Step1] Avg MSE: {np.mean(mse_vals):.4f}, Avg CE: {np.mean(ce_vals):.4f}, "
-          f"Clean Match: {np.mean(clean_ratios_1)*100:.2f}%, Train Acc: {train_acc1:.2f}%")
-
-    print("[Step1] Per-Class Accuracy:", end=' ')
+    print(f"\n[Step1] Avg CE (REIN): {np.mean(ce_vals):.4f}, "
+          f"Target Match (by pred==label): {np.mean(clean_ratios)*100:.2f}%, Train Acc: {train_acc1:.2f}%"
+    )
+    
+    print("[Step1] Per-Class Accuracy (Clean):")
+    per_class_stats_rein = [
+        f"Class {cls}: {class_correct_rein[cls]}/{class_total[cls]} ({100.0 * class_correct_rein[cls] / class_total[cls]:.2f}%)"
+        if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
+        for cls in range(num_classes)
+    ]
+    print(" | ".join(per_class_stats_rein))
     per_class_stats = [
         f"Class {cls}: {class_correct[cls]}/{class_total[cls]} ({100.0 * class_correct[cls] / class_total[cls]:.2f}%)"
         if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
         for cls in range(num_classes)
     ]
     print(" | ".join(per_class_stats))
+    
+    print("[Step2] Per-Class Accuracy (Noise):")
+    per_class_stats_rein = [
+        f"Class {cls}: {class_noise_correct_rein[cls]}/{class_noise_total[cls]} ({100.0 * class_noise_correct_rein[cls] / class_noise_total[cls]:.2f}%)"
+        if class_noise_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
+        for cls in range(num_classes)
+    ]
+    print(" | ".join(per_class_stats_rein))
+    per_class_stats = [
+        f"Class {cls}: {class_noise_correct[cls]}/{class_noise_total[cls]} ({100.0 * class_noise_correct[cls] / class_noise_total[cls]:.2f}%)"
+        if class_noise_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
+        for cls in range(num_classes)
+    ]
+    print(" | ".join(per_class_stats))
+    
 
-def client_update_step2(client_model, global_model, optimizer, loader, config, mix_ratio):
-    T = config['kd_temperature']
-    lambda_kd = config['kd_lambda']
-    mkd_lambda = config['mkd_lambda']
+    # === Clean detection summary ===
+    print(f"[Step1] Detected Clean: {detected_clean_total}, "
+          f"True Clean: {true_clean_total}, "
+          f"Correctly Detected: {correct_detected_clean_total}, "
+          f"False Positives: {false_detected_clean_total}, "
+          f"Missed Clean Samples: {missed_clean_total}"
+    )
+    
+    return class_total, dynamic_boost
+    
+def client_update_with_rce(client_model, global_model, optimizers, loader, config, mix_ratio, class_total, class_p_list=None, dynamic_boost=None, lambda_rce=0.5):
     num_classes = config['num_classes']
     device = config['device']
 
     client_model.eval()
-    client_model.train1()  # Adapter1만 학습
+    client_model.train()
 
-    ce_vals, kd_vals, mkd_vals, clean_ratios_2 = [], [], [], []
-    correct2, total2 = 0, 0
+    optimizer_rein, optimizer_rein2 = optimizers
+
+    ce_vals, rce_vals, clean_ratios = [], [], []
+    correct1, total1 = 0, 0
+
     class_correct = defaultdict(int)
     class_total = defaultdict(int)
+    class_correct_rein = defaultdict(int)
+    class_noise_correct = defaultdict(int)
+    class_noise_correct_rein = defaultdict(int)
+    class_noise_total = defaultdict(int)
 
-    for inputs, targets, _, _ in loader:
-        inputs, targets = inputs.to(device), targets.to(device)
+    detected_clean_total = 0
+    true_clean_total = 0
+    correct_detected_clean_total = 0
+    false_detected_clean_total = 0
+    missed_clean_total = 0
 
-        # === Global model forward ===
+    for inputs, targets, clean_targets, _ in loader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        clean_targets = clean_targets.to(device)
+
         with torch.no_grad():
             feats_global = global_model.forward_features(inputs)[:, 0, :]
             logits_global = global_model.linear_rein(feats_global)
             pred_global = logits_global.argmax(dim=1)
 
-        # === Client model forward ===
-        feats_fused = client_model.forward_fused_features(inputs)[:, 0, :]
-        logits_fused = client_model.linear_rein(feats_fused)
-        pred_fused = logits_fused.argmax(dim=1)
+        linear_accurate_global_rein = (pred_global == targets)
 
-        linear_accurate = (pred_global == targets)
-        # mask_weight = 0.1 + 0.9 * linear_accurate.float()
-        mask_weight = mix_ratio + (1-mix_ratio) * linear_accurate.float() 
+        feats_rein = client_model.forward_features(inputs)[:, 0, :]
+        logits_rein = client_model.linear_rein(feats_rein)
 
-        # print("logits_fused shape:", logits_fused.shape)
-        # print("logits_global shape:", logits_global.shape)
+        feats_rein2 = client_model.forward_features2(inputs)[:, 0, :]
+        logits_rein2 = client_model.linear_rein2(feats_rein2)
 
-        # === KD from global model ===
-        ce = F.cross_entropy(logits_fused, targets, reduction='none')
-        kd = F.kl_div(
-            F.log_softmax(logits_fused / T, dim=1),
-            F.softmax(logits_global / T, dim=1),
-            reduction='batchmean'
-        ) * (T * T)
+        if class_p_list is not None:
+            logits_rein = logits_rein + 0.5 * class_p_list
+            logits_rein2 = logits_rein2 + 0.5 * class_p_list
 
-        # === MKD: adapter2 → fused ===
-        with torch.no_grad():
-            feats2 = client_model.forward_features2(inputs)[:, 0, :]
-            logits2 = client_model.linear_rein(feats2)
+        reverse_labels = torch.full_like(logits_rein, fill_value=1 / (num_classes - 1))
+        reverse_labels.scatter_(1, targets.view(-1, 1), 0)
 
-        loss_mkd = F.kl_div(
-            F.log_softmax(logits2 / T, dim=1),
-            F.softmax(logits_fused.detach() / T, dim=1),
-            reduction='batchmean'
-        ) * (T * T)
+        loss_ce = F.cross_entropy(logits_rein, targets, reduction='none')
+        loss_ce2 = F.cross_entropy(logits_rein2, targets, reduction='none')
 
-        # === Total Loss ===
-        loss = (mask_weight * ce).mean() + lambda_kd * kd + mkd_lambda * loss_mkd
-        # loss = ce.mean() + lambda_kd * kd + mkd_lambda * loss_mkd
+        log_probs_rein = F.log_softmax(-logits_rein, dim=1)
+        log_probs_rein2 = F.log_softmax(-logits_rein2, dim=1)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        loss_rce = -(reverse_labels * log_probs_rein).sum(dim=1)
+        loss_rce2 = -(reverse_labels * log_probs_rein2).sum(dim=1)
 
-        # === Stats ===
-        ce_vals.append(ce.mean().item())
-        kd_vals.append(kd.mean().item())
-        mkd_vals.append(loss_mkd.item())
-        clean_ratios_2.append(linear_accurate.float().mean().item())
-        correct2 += (pred_fused == targets).sum().item()
-        total2 += targets.size(0)
+        # total_loss_rein = loss_ce + lambda_rce * loss_rce
+        total_loss_rein = loss_rce
+        # total_loss_rein2 = loss_ce2 + lambda_rce * loss_rce2
+        total_loss_rein2 = loss_ce2
 
-        for t, p in zip(targets, pred_fused):
-            class_total[t.item()] += 1
-            if t.item() == p.item():
-                class_correct[t.item()] += 1
+        masked_loss_rein = total_loss_rein.mean()
+        masked_loss_rein2 = (linear_accurate_global_rein * total_loss_rein2).mean()
 
-    train_acc2 = 100. * correct2 / total2
-    print(f"\n[Step2] CE: {np.mean(ce_vals):.4f}, KD: {np.mean(kd_vals):.4f}, MKD: {np.mean(mkd_vals):.4f}, "
-          f"Clean Match: {np.mean(clean_ratios_2)*100:.2f}%, Train Acc: {train_acc2:.2f}%")
+        optimizer_rein.zero_grad()
+        optimizer_rein2.zero_grad()
 
-    print("[Step2] Per-Class Accuracy:", end=' ')
+        total_loss = masked_loss_rein + masked_loss_rein2
+        total_loss.backward()
+
+        optimizer_rein.step()
+        optimizer_rein2.step()
+
+        preds = logits_rein2.argmax(dim=1)
+
+        correct1 += (preds == targets).sum().item()
+        total1 += targets.size(0)
+
+        ce_vals.append(loss_ce.mean().item())
+        rce_vals.append(loss_rce.mean().item())
+
+        is_actually_clean = (targets == clean_targets)
+        total_clean = is_actually_clean.sum().item()
+        correct_detected_clean = (linear_accurate_global_rein & is_actually_clean).sum().item()
+        false_detected_clean = (linear_accurate_global_rein & ~is_actually_clean).sum().item()
+        missed_clean = (~linear_accurate_global_rein & is_actually_clean).sum().item()
+
+        detected_clean_total += linear_accurate_global_rein.sum().item()
+        true_clean_total += total_clean
+        correct_detected_clean_total += correct_detected_clean
+        false_detected_clean_total += false_detected_clean
+        missed_clean_total += missed_clean
+
+        clean_ratios.append((preds == clean_targets).float().mean().item())
+
+        for i in range(targets.size(0)):
+            label = clean_targets[i].item()
+            noise_label = targets[i].item()
+            pred_label_rein = logits_rein.argmax(dim=1)[i].item()
+            pred_label = preds[i].item()
+
+            class_total[label] += 1
+            class_noise_total[noise_label] += 1
+
+            if label == pred_label:
+                class_correct[label] += 1
+            if label == pred_label_rein:
+                class_correct_rein[label] += 1
+            if noise_label == pred_label:
+                class_noise_correct[noise_label] += 1
+            if noise_label == pred_label_rein:
+                class_noise_correct_rein[noise_label] += 1
+
+    train_acc1 = 100. * correct1 / total1
+    print(f"\n[Step1-RCE] Avg CE: {np.mean(ce_vals):.4f}, Avg RCE: {np.mean(rce_vals):.4f}, Train Acc: {train_acc1:.2f}%"
+    )
+
+    print("[Step1-RCE] Per-Class Accuracy (Clean):")
+    per_class_stats_rein = [
+        f"Class {cls}: {class_correct_rein[cls]}/{class_total[cls]} ({100.0 * class_correct_rein[cls] / class_total[cls]:.2f}%)"
+        if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
+        for cls in range(num_classes)
+    ]
+    print(" | ".join(per_class_stats_rein))
+
     per_class_stats = [
         f"Class {cls}: {class_correct[cls]}/{class_total[cls]} ({100.0 * class_correct[cls] / class_total[cls]:.2f}%)"
         if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
         for cls in range(num_classes)
     ]
-    print(" | ".join(per_class_stats))
+    print(" | " .join(per_class_stats))
+
+    print("[Step2-RCE] Per-Class Accuracy (Noise):")
+    per_class_stats_rein_noise = [
+        f"Class {cls}: {class_noise_correct_rein[cls]}/{class_noise_total[cls]} ({100.0 * class_noise_correct_rein[cls] / class_noise_total[cls]:.2f}%)"
+        if class_noise_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
+        for cls in range(num_classes)
+    ]
+    print(" | ".join(per_class_stats_rein_noise))
+
+    per_class_stats_noise = [
+        f"Class {cls}: {class_noise_correct[cls]}/{class_noise_total[cls]} ({100.0 * class_noise_correct[cls] / class_noise_total[cls]:.2f}%)"
+        if class_noise_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
+        for cls in range(num_classes)
+    ]
+    print(" | ".join(per_class_stats_noise))
+
+    print(f"[Step1] Detected Clean: {detected_clean_total}, True Clean: {true_clean_total}, Correctly Detected: {correct_detected_clean_total}, False Positives: {false_detected_clean_total}, Missed Clean Samples: {missed_clean_total}"
+    )
+
+    return class_total, dynamic_boost
+
+
+    
+    
+    
+    
+    
+    
+    
+    
+# ROFL
+class LocalUpdateRFL:
+    def __init__(self, args, dataset=None, user_idx=None, idxs=None):
+        self.args = args
+        self.dataset = dataset
+        self.user_idx = user_idx
+        self.idxs = idxs
+        
+        self.pseudo_labels = torch.zeros(len(self.dataset), dtype=torch.long, device=self.args.device)
+        self.sim = torch.nn.CosineSimilarity(dim=1) 
+        self.loss_func = torch.nn.CrossEntropyLoss(reduce=False)
+        self.ldr_train = DataLoader(DatasetSplitRFL(dataset, idxs), batch_size=self.args.local_bs, shuffle=True)
+        self.ldr_train_tmp = DataLoader(DatasetSplitRFL(dataset, idxs), batch_size=1, shuffle=True)
+            
+    def RFLloss(self, logit, labels, feature, f_k, mask, small_loss_idxs, lambda_cen, lambda_e, new_labels):
+        mse = torch.nn.MSELoss(reduce=False)
+        ce = torch.nn.CrossEntropyLoss()
+        sm = torch.nn.Softmax(dim=1)
+        lsm = torch.nn.LogSoftmax(dim=1)
+   
+        L_c = ce(logit[small_loss_idxs], new_labels)
+        L_cen = torch.sum(mask[small_loss_idxs] * torch.sum(mse(feature[small_loss_idxs], f_k[labels[small_loss_idxs]]), 1))
+        L_e = -torch.mean(torch.sum(sm(logit[small_loss_idxs]) * lsm(logit[small_loss_idxs]), dim=1))
+        
+        if self.args.g_epoch < 100:
+            lambda_cen = 0.01 * (self.args.g_epoch+1)
+        
+        return L_c + (lambda_cen * L_cen) + (lambda_e * L_e)
+             
+    def get_small_loss_samples(self, y_pred, y_true, forget_rate):
+        loss = self.loss_func(y_pred, y_true)
+        ind_sorted = np.argsort(loss.data.cpu()).cuda()
+        loss_sorted = loss[ind_sorted]
+
+        remember_rate = 1 - forget_rate
+        num_remember = int(remember_rate * len(loss_sorted))
+
+        ind_update=ind_sorted[:num_remember]
+        
+        return ind_update
+        
+    def train(self, net, f_G, client_num):
+        optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr, momentum=self.args.momentum, weight_decay=self.args.weight_decay)
+        epoch_loss = []
+        
+        net.eval()
+        f_k = torch.zeros(self.args.num_classes, self.args.feature_dim, device=self.args.device)
+        n_labels = torch.zeros(self.args.num_classes, 1, device=self.args.device)
+        
+        # obtain global-guided pseudo labels y_hat by y_hat_k = C_G(F_G(x_k))
+        # initialization of global centroids
+        # obtain naive average feature
+        with torch.no_grad():
+            for batch_idx, (images, labels, idxs) in enumerate(self.ldr_train_tmp):
+                images, labels = images.to(self.args.device), labels.to(self.args.device)
+                logit, feature = net.forward_wfeat(images)
+                self.pseudo_labels[idxs] = torch.argmax(logit)    
+                if self.args.g_epoch == 0:
+                    f_k[labels] += feature
+                    n_labels[labels] += 1
+            
+        if self.args.g_epoch == 0:
+            for i in range(len(n_labels)):
+                if n_labels[i] == 0:
+                    n_labels[i] = 1           
+            f_k = torch.div(f_k, n_labels)
+        else:
+            f_k = f_G
+
+        net.train()
+        for iter in range(self.args.local_ep):
+            batch_loss = []
+            correct_num = 0
+            total = 0
+            for batch_idx, batch in enumerate(self.ldr_train):
+                net.zero_grad()        
+                images, labels, idx = batch
+                images, labels = images.to(self.args.device), labels.to(self.args.device)
+                logit, feature = net.forward_wfeat(images)
+                feature = feature.detach()
+                f_k = f_k.to(self.args.device)
+                
+                small_loss_idxs = self.get_small_loss_samples(logit, labels, self.args.forget_rate)
+
+                y_k_tilde = torch.zeros(self.args.local_bs, device=self.args.device)
+                mask = torch.zeros(self.args.local_bs, device=self.args.device)
+                for i in small_loss_idxs:
+                    y_k_tilde[i] = torch.argmax(self.sim(f_k, torch.reshape(feature[i], (1, self.args.feature_dim))))
+                    if y_k_tilde[i] == labels[i]:
+                        mask[i] = 1
+ 
+                # When to use pseudo-labels
+                if self.args.g_epoch < self.args.T_pl:
+                    for i in small_loss_idxs:    
+                        self.pseudo_labels[idx[i]] = labels[i]
+                
+                # For loss calculating
+                idx = idx.cpu()  # <- 반드시 CPU로
+                small_loss_idxs = small_loss_idxs.cpu()
+                new_labels = mask[small_loss_idxs]*labels[small_loss_idxs] + (1-mask[small_loss_idxs])*self.pseudo_labels[idx[small_loss_idxs]]
+                new_labels = new_labels.type(torch.LongTensor).to(self.args.device)
+                
+                loss = self.RFLloss(logit, labels, feature, f_k, mask, small_loss_idxs, self.args.lambda_cen, self.args.lambda_e, new_labels)
+
+                # weight update by minimizing loss: L_total = L_c + lambda_cen * L_cen + lambda_e * L_e
+                loss.backward()
+                optimizer.step()
+
+                # obtain loss based average features f_k,j_hat from small loss dataset
+                f_kj_hat = torch.zeros(self.args.num_classes, self.args.feature_dim, device=self.args.device)
+                n = torch.zeros(self.args.num_classes, 1, device=self.args.device)
+                for i in small_loss_idxs:
+                    f_kj_hat[labels[i]] += feature[i]
+                    n[labels[i]] += 1
+                for i in range(len(n)):
+                    if n[i] == 0:
+                        n[i] = 1
+                f_kj_hat = torch.div(f_kj_hat, n)
+
+                # update local centroid f_k
+                one = torch.ones(self.args.num_classes, 1, device=self.args.device)
+                f_k = (one - self.sim(f_k, f_kj_hat).reshape(self.args.num_classes, 1) ** 2) * f_k + (self.sim(f_k, f_kj_hat).reshape(self.args.num_classes, 1) ** 2) * f_kj_hat
+
+                batch_loss.append(loss.item())
+                
+            epoch_loss.append(sum(batch_loss)/len(batch_loss))
+            
+        return net.state_dict(), sum(epoch_loss) / len(epoch_loss), f_k

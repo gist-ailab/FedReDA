@@ -20,10 +20,7 @@ def get_transform(transform_type='default', image_size=224, args=None):
         
         train_transform = transforms.Compose([
             transforms.Resize((256, 256)),
-            # transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
-            # transforms.RandomVerticalFlip(p=0.5),
-            # transforms.ColorJitter(),
             transforms.RandomCrop(size=(image_size, image_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)
@@ -81,7 +78,7 @@ def get_dataset(args):
     return dataset_train, dataset_test, dict_users
 
 class ham10000_dataset(Data.Dataset):
-    def __init__(self, train=True, transform=None, target_transform=None, noise_rate=0.3, split_percentage=0.9, seed=1, num_classes=7, feature_size=3*224*224, norm_std=0.1):
+    def __init__(self, train=True, transform=None, target_transform=None, noise_rate=0.3, split_percentage=0.9, seed=1, num_classes=7, feature_size=512, norm_std=0.1):
             
         self.transform = transform
         self.target_transform = target_transform
@@ -89,25 +86,41 @@ class ham10000_dataset(Data.Dataset):
         
         original_images = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/train_images.npy', allow_pickle=True)
         original_labels = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/train_labels.npy', allow_pickle=True)
-        data = torch.from_numpy(original_images).float()
-        targets = torch.from_numpy(original_labels)
+        data = torch.from_numpy(original_images)
+        # targets = torch.from_numpy(original_labels)
+        targets = original_labels
 
         dataset = zip(data, targets)
         
-        new_labels = util.get_instance_noisy_label(noise_rate, dataset, targets, num_classes, feature_size, norm_std, seed)
+        new_labels = util.get_instance_noisy_label(noise_rate, dataset, targets, num_classes, norm_std, seed, cache_path='/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/soft_labels.npy')
 
         self.train_data, self.val_data, self.train_noisy_labels, self.val_noisy_labels, self.train_clean_labels, self.val_clean_labels = \
             util.data_split(original_images, targets, new_labels, num_classes, split_percentage, seed)
-        if self.train:      
-            self.train_data = self.train_data.reshape((-1, 3, 224, 224))
-            self.train_data = self.train_data.transpose((0, 2, 3, 1))
-            print('building ham10000 train dataset')
-            print(self.train_data.shape)
+
+        # Image.fromarray(original_images[0].astype(np.uint8)).save("original_0.png")
+
+        # train_img = self.train_data[0].astype(np.uint8)
+        # Image.fromarray(train_img).save("split_train_0.png")
+        # exit()
+
+        # if self.train:      
+        #     self.train_data = self.train_data.reshape((-1, 3, 224, 224))
+        #     self.train_data = self.train_data.transpose((0, 2, 3, 1)).astype(np.uint8)
+        #     print('building ham10000 train dataset')
+        #     print(self.train_data.shape)
         
+        # else:
+        #     self.val_data = self.val_data.reshape((-1, 3, 224, 224))
+        #     self.val_data = self.val_data.transpose((0, 2, 3, 1)).astype(np.uint8)
+        #     print('building ham10000 val dataset')
+        #     print(self.val_data.shape)
+        if self.train:
+            self.train_data = self.train_data.astype(np.uint8)
+            print("building ham10000 train dataset")
+            print(self.train_data.shape)
         else:
-            self.val_data = self.val_data.reshape((-1, 3, 224, 224))
-            self.val_data = self.val_data.transpose((0, 2, 3, 1))
-            print('building ham10000 val dataset')
+            self.val_data = self.val_data.astype(np.uint8)
+            print("building ham10000 val dataset")
             print(self.val_data.shape)
 
     def __getitem__(self, index):
@@ -145,8 +158,8 @@ class ham10000_test_dataset(Data.Dataset):
            
         self.test_data = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/test_images.npy', allow_pickle=True)
         self.test_labels = np.load('/home/work/Workspaces/yunjae_heo/FedLNL/data/ham10000/test_labels.npy', allow_pickle=True)
-        self.test_data = self.test_data.reshape((1512,3,224,224))
-        self.test_data = self.test_data.transpose((0, 2, 3, 1))
+        # self.test_data = self.test_data.reshape((1512,3,224,224))
+        # self.test_data = self.test_data.transpose((0, 2, 3, 1))
 
         print('building ham10000 test dataset')
         print(self.test_data.shape)

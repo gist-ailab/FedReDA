@@ -39,3 +39,26 @@ np.save(f'/home/work/Workspaces/yunjae_heo/FedLNL/data/{dataset}/{mode}_labels.n
 print(len(label_list_np))
 print(label_list_np[-3:])
 print(f"Image shape: {img_np.shape}, dtype: {img_np.dtype}")
+
+if __name__ == '__main__':
+    dataset = 'ham10000'
+    mode = 'train'
+    npy_img_path = f'/home/work/Workspaces/yunjae_heo/FedLNL/data/{dataset}/{mode}_images.npy'
+    npy_label_path = f'/home/work/Workspaces/yunjae_heo/FedLNL/data/{dataset}/{mode}_labels.npy'
+
+    # ✅ Numpy 파일 불러오기
+    img_np = np.load(npy_img_path)  # shape: (N, 224, 224, 3)
+    label_np = np.load(npy_label_path)  # shape: (N,)
+
+    print(f"Loaded image shape: {img_np.shape}")
+    print(f"Loaded label shape: {label_np.shape}")
+    print(f"First label: {label_np[0]}")
+
+    # ✅ 첫 번째 이미지 확인
+    img = img_np[0]  # shape: (224, 224, 3)
+    print(f"First image min/max: {img.min()}/{img.max()}, dtype: {img.dtype}")
+
+    # ✅ 이미지 저장
+    img_pil = Image.fromarray(img.astype(np.uint8))  # 혹시 float로 저장되었을 경우 대비
+    img_pil.save("input_tensor.png")
+    print("Saved first image to input_tensor.png ✅")

@@ -179,3 +179,4 @@ cython_debug/
 *.pth
 *.zip
 *.npy
+*.main1

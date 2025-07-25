@@ -10,7 +10,7 @@ from collections import Counter
 from util.util import *
 from util.options import args_parser
 from util.util import load_data, wrap_as_local_dataset, get_prob, create_data, combine_data
-from update import train_prox, average_weights, evaluate
+from update import train_prox, average_weights, evaluate, average_reins
 import model
 import model_dino
 import dino_variant
@@ -77,40 +77,66 @@ def main(args):
             num_workers=args.num_workers, shuffle=True, drop_last=False
         ) for i in range(args.num_clients)
     ]
+    
+    clients_train_class_num_list = []
+    for i in range(args.num_clients):
+        class_num_list = [0 for _ in range(args.num_classes)]
+        for j in range(len(clients_train_dataset_list[i])):
+            class_num_list[int(clients_train_dataset_list[i][j][1])] += 1
+        
+        # Create a tensor from class_num_list and move it to the specified device
+        class_num_tensor = torch.cuda.FloatTensor(class_num_list)
+
+        # Perform calculations
+        class_p_list = class_num_tensor / class_num_tensor.sum()
+        class_p_list = torch.log(class_p_list)
+        class_p_list = class_p_list.view(1, -1)
+        
+        clients_train_class_num_list.append(class_p_list)
 
     # construct model
     print('constructing model...')
     if args.dataset == 'ham10000':
         model_load = dino_variant._small_dino
         variant = dino_variant._small_variant
-        pretrained = torch.hub.load('facebookresearch/dinov2', model_load)
-        dino_state_dict = pretrained.state_dict()
+        dino_state_dict = torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth')
         global_model = model_dino.ReinDinov2(variant, dino_state_dict, args.num_classes).cuda()
     else:
         raise NotImplementedError
 
     print('Starting Federated Proximal Training...')
+    Final_acc = 0.
     for rd in range(args.round3):
+        # client_model_list = []
         local_weights_list = []
         selected = random.sample(range(args.num_clients), args.num_clients)
         for cid in selected:
             print(f"[Round {rd+1}] Training client {cid+1}")
             local_model = copy.deepcopy(global_model).cuda()
-            optimizer = torch.optim.SGD(local_model.parameters(), lr=args.lr_w, momentum=args.momentum)
-            # optimizer = torch.optim.AdamW(local_model.parameters(), lr=args.lr_f, weight_decay=args.weight_decay)
+            # optimizer = torch.optim.SGD(local_model.parameters(), lr=args.lr_w, momentum=args.momentum)
+            optimizer = torch.optim.AdamW(local_model.parameters(), lr=args.lr_f, weight_decay=args.weight_decay)
             train_loader = clients_train_loader_list[cid]
             train_prox(train_loader, epoch=rd, model=local_model,
-                       global_model=global_model, optimizer1=optimizer, mu=args.mu, args=args)
+                       global_model=global_model, optimizer1=optimizer, mu=args.mu, args=args,
+                       class_p_list=clients_train_class_num_list[cid])
             local_weights_list.append(copy.deepcopy(local_model.state_dict()))
+            # client_model_list.append(local_model.backbone)
 
         global_weights = average_weights(local_weights_list)
         global_model.load_state_dict(global_weights)
+        # average_reins(global_model.backbone, client_model_list)
 
         test_acc = evaluate(test_loader, global_model)
         print(f"Round [{rd+1}] Test Accuracy: {test_acc:.4f}")
 
-    return evaluate(test_loader, global_model)
-
+        if round+1 > args.round3-10:
+            Final_acc += test_acc
+        
+    print('----------Finished FedAvg Training----------')
+    Final_acc /= 10
+    print(f'Final Test Accuracy: {Final_acc:.4f} %')
+        
+    # return evaluate(test_loader, global_model)
 
 if __name__ == '__main__':
     acc_list = []

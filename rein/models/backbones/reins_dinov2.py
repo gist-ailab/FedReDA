@@ -20,6 +20,55 @@ class ReinsDinoVisionTransformer(DinoVisionTransformer):
             x = blk(x)
             x = self.reins.forward(x, idx, batch_first=True, has_cls_token=True)
         return x
+    
+    def forward_features2(self, x, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            x = self.reins2.forward(x, idx, batch_first=True, has_cls_token=True)
+        return x
+
+    def forward_features_no_rein(self, x, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for blk in self.blocks:
+            x = blk(x)
+        return x
+
+    def train(self, mode: bool = True):
+        if not mode:
+            return super().train(mode)
+        set_requires_grad(self, ["reins", "linear"])
+        set_train(self, ["reins", "linear"])
+
+class SelectiveReinsDinoVisionTransformer(DinoVisionTransformer):
+    def __init__(self, rein_layers=None, **kwargs):
+        """
+        Args:
+            rein_layers (list): Rein 어댑터를 적용할 layer 인덱스 리스트
+        """
+        super().__init__(**kwargs)
+        self.rein_layers = rein_layers if rein_layers is not None else []
+        self.reins = Reins(
+            num_layers=kwargs['depth'],
+            embed_dims=kwargs['embed_dim'],
+            patch_size=kwargs['patch_size'],
+        )
+
+    def forward_features(self, x, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            if idx in self.rein_layers:
+                x = self.reins.forward(x, idx, batch_first=True, has_cls_token=True)
+        return x
+    
+    def forward_features2(self, x, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            if idx in self.rein_layers:
+                x = self.reins2.forward(x, idx, batch_first=True, has_cls_token=True)
+        return x
 
     def forward_features_no_rein(self, x, masks=None):
         x = self.prepare_tokens_with_masks(x, masks)
@@ -156,8 +205,8 @@ class LoRAFusedDualReinsDinoVisionTransformer(DinoVisionTransformer):
             x = blk(x)
             delta1 = self.reins1.forward_delta_only(x, idx, batch_first=True, has_cls_token=True)
             delta2 = self.reins2.forward_delta_only(x, idx, batch_first=True, has_cls_token=True)
-            x = x + self.fusion_alpha * delta1 + (1 - self.fusion_alpha) * delta2
-            # x = x + delta1 + delta2
+            # x = x + self.fusion_alpha * delta1 + (1 - self.fusion_alpha) * delta2
+            x = x + delta1 + delta2
             features.append(x)
         return features
 

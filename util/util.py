@@ -7,9 +7,83 @@ import json
 from math import inf
 from scipy import stats
 import torchvision.transforms as transforms
-from torch.utils.data import Subset
-
+from torch.utils.data import Subset, DataLoader, TensorDataset
+from sklearn.metrics import balanced_accuracy_score
+from torchvision import models, transforms
+from tqdm import tqdm
+from PIL import Image
 from util import dataset
+import torch.nn as nn
+
+class LogitAdjust(nn.Module):
+    def __init__(self, cls_num_list, tau=1, weight=None):
+        super(LogitAdjust, self).__init__()
+        cls_num_list = torch.cuda.FloatTensor(cls_num_list)
+        cls_p_list = cls_num_list / cls_num_list.sum()
+        m_list = tau * torch.log(cls_p_list)
+        self.m_list = m_list.view(1, -1)
+        self.weight = weight
+
+    def forward(self, x, target):
+        x_m = x + self.m_list
+        return F.cross_entropy(x_m, target, weight=self.weight)
+
+def get_transform(transform_type='default', image_size=224, args=None):
+
+    if transform_type == 'default':
+        IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+
+        mean = IMAGENET_DEFAULT_MEAN
+        std = IMAGENET_DEFAULT_STD
+
+        
+        train_transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation([-45, 45]),
+            transforms.RandomCrop(size=(image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+
+        test_transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.CenterCrop((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)
+        ])
+    return train_transform, test_transform
+
+class FocalLossWithLogitAdjustment(nn.Module):
+    def __init__(self, gamma=2.0, class_log_prior=None, alpha=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.class_log_prior = class_log_prior  # shape: [1, num_classes]
+        self.alpha = alpha  # class weight tensor: [num_classes]
+        self.reduction = reduction
+        self.t = 1.0
+
+    def forward(self, logits, targets):
+        if self.class_log_prior is not None:
+            logits = logits + self.t*self.class_log_prior.to(logits.device)
+
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+        targets_one_hot = F.one_hot(targets, num_classes=logits.size(1)).float()
+
+        pt = (probs * targets_one_hot).sum(dim=1)
+        log_pt = (log_probs * targets_one_hot).sum(dim=1)
+
+        focal_term = (1 - pt).pow(self.gamma)
+        loss = -focal_term * log_pt
+
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            loss = loss * alpha_t.to(logits.device)
+
+        return loss.mean() if self.reduction == 'mean' else loss
 
 def read_conf(json_path):
     """
@@ -112,9 +186,6 @@ def cross_entropy_soft_label(pred_logits, soft_targets, reduction='none'):
 recall_level_default = 0.95
 
 def validation_accuracy(model, loader, device, mode='rein'):
-    total = 0
-    correct = 0
-
     def linear(model, inputs):
         f = model(inputs)
         outputs = model.linear(f)
@@ -141,17 +212,16 @@ def validation_accuracy(model, loader, device, mode='rein'):
     def rein2(model, inputs):
         f = model.forward_features2(inputs)
         f = f[:, 0, :]
-        outputs = model.linear_rein(f)
+        outputs = model.linear_rein2(f)
         return outputs
 
     def no_rein(model, inputs):
         f = model.forward_features_no_rein(inputs)
         f = f[:, 0, :]
-        outputs = model.linear(f)
+        outputs = model.linear_norein(f)
         return outputs
 
     if mode == 'rein':
-        # Use rein() if model has forward_features
         out = rein
     elif mode == 'rein1':
         out = rein1
@@ -164,6 +234,11 @@ def validation_accuracy(model, loader, device, mode='rein'):
     else:
         out = linear
 
+    total = 0
+    correct = 0
+    all_preds = []
+    all_targets = []
+    
     model.to(device)
     model.eval()
     with torch.no_grad():
@@ -175,10 +250,17 @@ def validation_accuracy(model, loader, device, mode='rein'):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = out(model, inputs)
             _, predicted = outputs.max(1)
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+            
             correct += predicted.eq(targets).sum().item()
             total += targets.size(0)
+    balanced_acc = balanced_accuracy_score(all_targets, all_preds)
+    normal_acc = correct / total
     
-    return correct / total
+    # return correct / total
+    return balanced_acc, normal_acc
 
 
 #################################FedBeat Utils#####################################
@@ -267,29 +349,36 @@ def load_data(args):
                                                  target_transform=transform_target)
         
     if args.dataset == 'ham10000':
+        train_transform, test_transform = get_transform()
         train_dataset = dataset.ham10000_dataset(True,
-                                                transform=transforms.Compose([
-                                                          transforms.ToTensor(),
-                                                          transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)), ]),
+                                                transform=train_transform,
                                                 target_transform=transform_target,
                                                 noise_rate=args.noise_rate,
                                                 split_percentage=args.split_percentage,
                                                 seed=args.seed)
 
         val_dataset = dataset.ham10000_dataset(False,
-                                              transform=transforms.Compose([
-                                                        transforms.ToTensor(),
-                                                        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)), ]),
+                                              transform=test_transform,
                                               target_transform=transform_target,
                                               noise_rate=args.noise_rate,
                                               split_percentage=args.split_percentage,
                                               seed=args.seed)
 
-        test_dataset = dataset.ham10000_test_dataset(transform=transforms.Compose([
-                                                              transforms.ToTensor(),
-                                                              transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)), ]),
+        test_dataset = dataset.ham10000_test_dataset(transform=test_transform,
                                                     target_transform=transform_target)
+        # print(f"Total images: {len(train_dataset)}")
+    
+        # img_arr = train_dataset.train_data[0]  # shape: (224, 224, 3)
 
+        # print(f"Image shape: {img_arr.shape}, dtype: {img_arr.dtype}, min/max: {img_arr.min()}/{img_arr.max()}")
+
+        # # np.uint8 보장
+        # if img_arr.dtype != np.uint8:
+        #     img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
+
+        # Image.fromarray(img_arr).save("input_tensor.png")
+        # print("Saved input_tenor.png ✅")
+        # exit()
 
     return train_dataset, val_dataset, test_dataset
 
@@ -371,12 +460,11 @@ def create_data(prob, size_per_client, total_dataset, num_classes=10, dataset_ty
                                                    )
 
         if dataset_type == 'ham10000':
+            train_transform, target_transform = get_transform()
             client_dataset = dataset.local_dataset(images,
                                                     noisy_labels,
                                                     clean_labels,
-                                                    transform=transforms.Compose([
-                                                            transforms.ToTensor(),
-                                                            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)), ]),
+                                                    transform=train_transform,
                                                     target_transform=transform_target
                                                     )
         clients.append(client_dataset)
@@ -458,12 +546,11 @@ def combine_data(clients_dataset_list, dataset_type='cifar10'):
                                                target_transform=transform_target
                                                )
     if dataset_type == 'ham10000':
+        train_transform, target_transform = get_transform()
         client_dataset = dataset.local_dataset(data,
                                                 noisy_labels,
                                                 clean_labels,
-                                                transform=transforms.Compose([
-                                                        transforms.ToTensor(),
-                                                        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)), ]),
+                                                transform=target_transform,
                                                 target_transform=transform_target
                                                 )
 
@@ -614,58 +701,193 @@ def wrap_subsets_to_local_dataset(subsets, full_dataset):
         ))
     return wrapped
 
-def get_instance_noisy_label(n, total_dataset, labels, num_classes, feature_size, norm_std, seed):
-    # n -> noise_rate
-    # dataset -> mnist, cifar10 # not train_loader
-    # labels -> labels (targets)
-    # label_num -> class number
-    # feature_size -> the size of input images (e.g. 28*28)
-    # norm_std -> default 0.1
-    # seed -> random_seed
-    print("adding noise to dataset...")
-    label_num = num_classes
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    torch.cuda.manual_seed(int(seed))
+# def get_instance_noisy_label(n, total_dataset, labels, num_classes, feature_size, norm_std, seed):
+#     # n -> noise_rate
+#     # dataset -> mnist, cifar10 # not train_loader
+#     # labels -> labels (targets)
+#     # label_num -> class number
+#     # feature_size -> the size of input images (e.g. 28*28)
+#     # norm_std -> default 0.1
+#     # seed -> random_seed
+#     print("adding noise to dataset...")
+#     label_num = num_classes
+#     np.random.seed(int(seed))
+#     torch.manual_seed(int(seed))
+#     torch.cuda.manual_seed(int(seed))
 
-    P = []
+#     P = []
+#     flip_distribution = stats.truncnorm((0 - n) / norm_std, (0.6 - n) / norm_std, loc=n, scale=norm_std)
+#     flip_rate = flip_distribution.rvs(labels.shape[0])
+
+#     if isinstance(labels, list):
+#         labels = torch.FloatTensor(labels)
+#     labels = labels.cuda()
+
+#     W = np.random.randn(label_num, feature_size, label_num)
+
+#     W = torch.FloatTensor(W).cuda()
+#     for i, (x, y) in enumerate(total_dataset):
+#         # 1*m *  m*10 = 1*10
+#         x = x.cuda()
+#         A = x.view(1, -1).mm(W[y]).squeeze(0)
+#         A[y] = -inf
+#         A = flip_rate[i] * F.softmax(A, dim=0)
+#         A[y] += 1 - flip_rate[i]
+#         P.append(A)
+#     P = torch.stack(P, 0).cpu().numpy()
+#     l = [i for i in range(label_num)]
+#     new_label = [np.random.choice(l, p=P[i]) for i in range(labels.shape[0])]
+#     record = [[0 for _ in range(label_num)] for i in range(label_num)]
+
+#     for a, b in zip(labels, new_label):
+#         a, b = int(a), int(b)
+#         record[a][b] += 1
+
+#     pidx = np.random.choice(range(P.shape[0]), 1000)
+#     cnt = 0
+#     for i in range(1000):
+#         if labels[pidx[i]] == 0:
+#             a = P[pidx[i], :]
+#             cnt += 1
+#         if cnt >= 10:
+#             break
+#     return np.array(new_label)
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from scipy import stats
+from torchvision import transforms, models
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+from math import inf
+import os
+
+
+def get_instance_noisy_label(n, total_dataset, labels, num_classes, norm_std=0.1, seed=42, cache_path=None):
+    """
+    Generate instance-dependent noisy labels with optional soft label caching.
+
+    Args:
+        n (float): average noise rate
+        total_dataset: iterable of (x, y)
+        labels (Tensor): clean labels
+        num_classes (int): number of classes
+        norm_std (float): std dev of flip rate
+        seed (int): random seed
+        cache_path (str): path to .npy file for saving/loading soft labels
+
+    Returns:
+        np.array: new noisy labels
+    """
+    print("adding instance-dependent noise to dataset (with 1-epoch training)...")
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Prepare transform & dataset for training
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+    images_tensor, labels_tensor = [], []
+
+    for x, y in tqdm(total_dataset, desc="Preparing dataset"):
+        if isinstance(x, torch.Tensor):
+            if x.ndim == 3 and x.shape[-1] == 3:
+                x = x.permute(2, 0, 1)
+            if x.max() > 1.0:
+                x = x / 255.0
+        elif isinstance(x, np.ndarray):
+            x = torch.from_numpy(x.transpose(2, 0, 1))
+            if x.max() > 1.0:
+                x = x / 255.0
+        else:
+            raise TypeError(f"Unexpected type: {type(x)}")
+
+        x_pil = transforms.ToPILImage()(x)
+        x_tensor = transform(x_pil)
+        images_tensor.append(x_tensor)
+        labels_tensor.append(y)
+
+    images_tensor = torch.stack(images_tensor)  # [N, 3, 224, 224]
+    labels_tensor = torch.tensor(labels_tensor).long()
+    ys = labels_tensor
+
+    # === 캐시 파일이 있으면 로드 ===
+    if cache_path is not None and os.path.exists(cache_path):
+        print(f"[Cache] Loading cached soft labels from {cache_path}")
+        soft_labels = torch.from_numpy(np.load(cache_path)).float()
+        if soft_labels.shape != (len(ys), num_classes):
+            raise ValueError(f"[Cache] Invalid shape in cache: {soft_labels.shape}")
+    else:
+        # === 학습 진행 ===
+        dataset = TensorDataset(images_tensor, labels_tensor)
+        loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+        model = models.resnet18(pretrained=True)
+        model.fc = nn.Linear(512, num_classes)
+        model = model.to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        criterion = nn.CrossEntropyLoss()
+
+        model.train()
+        for batch in tqdm(loader, desc="Training ResNet18 (1 epoch)"):
+            inputs, targets = batch[0].to(device), batch[1].to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        extractor = nn.Sequential(*list(model.children())[:-1])
+        classifier = model.fc
+
+        soft_labels = []
+        with torch.no_grad():
+            for x in tqdm(images_tensor, desc="Generating soft labels"):
+                x = x.unsqueeze(0).to(device)
+                feat = extractor(x).view(1, -1)
+                logits = classifier(feat)
+                prob = F.softmax(logits, dim=1).squeeze(0)
+                soft_labels.append(prob.cpu())
+
+        soft_labels = torch.stack(soft_labels, dim=0)  # [N, C]
+
+        # === 캐시 저장 ===
+        if cache_path is not None:
+            np.save(cache_path, soft_labels.numpy())
+            print(f"[Cache] Saved soft labels to {cache_path}")
+
+    # === 노이즈 부여 ===
     flip_distribution = stats.truncnorm((0 - n) / norm_std, (0.6 - n) / norm_std, loc=n, scale=norm_std)
-    flip_rate = flip_distribution.rvs(labels.shape[0])
+    flip_rate = flip_distribution.rvs(len(ys))
 
-    if isinstance(labels, list):
-        labels = torch.FloatTensor(labels)
-    labels = labels.cuda()
+    noisy_labels = []
+    for i in range(len(ys)):
+        y = ys[i].item()
+        p = soft_labels[i].clone()
+        p[y] = 0.0
+        if p.sum() == 0:
+            p = torch.ones_like(p) / (num_classes - 1)
+            p[y] = 0
+        else:
+            p = p / p.sum()
+        p = flip_rate[i] * p
+        p[y] = 1.0 - flip_rate[i]
+        p = p.numpy()
+        noisy_labels.append(np.random.choice(num_classes, p=p))
 
-    W = np.random.randn(label_num, feature_size, label_num)
-
-
-    W = torch.FloatTensor(W).cuda()
-    for i, (x, y) in enumerate(total_dataset):
-        # 1*m *  m*10 = 1*10
-        x = x.cuda()
-        A = x.view(1, -1).mm(W[y]).squeeze(0)
-        A[y] = -inf
-        A = flip_rate[i] * F.softmax(A, dim=0)
-        A[y] += 1 - flip_rate[i]
-        P.append(A)
-    P = torch.stack(P, 0).cpu().numpy()
-    l = [i for i in range(label_num)]
-    new_label = [np.random.choice(l, p=P[i]) for i in range(labels.shape[0])]
-    record = [[0 for _ in range(label_num)] for i in range(label_num)]
-
-    for a, b in zip(labels, new_label):
-        a, b = int(a), int(b)
-        record[a][b] += 1
-
-    pidx = np.random.choice(range(P.shape[0]), 1000)
-    cnt = 0
-    for i in range(1000):
-        if labels[pidx[i]] == 0:
-            a = P[pidx[i], :]
-            cnt += 1
-        if cnt >= 10:
-            break
-    return np.array(new_label)
+    return np.array(noisy_labels)
 
 
 def data_split(data, clean_labels, noisy_labels, num_classes=10, split_percentage=0.9, seed=1):
@@ -696,6 +918,42 @@ def data_split(data, clean_labels, noisy_labels, num_classes=10, split_percentag
         val_clean_labels_set.extend(val_clean_labels)
     return np.array(train_data_set), np.array(val_data_set), np.array(train_noisy_labels_set), \
            np.array(val_noisy_labels_set), np.array(train_clean_labels_set), np.array(val_clean_labels_set)
+
+# def data_split(data, clean_labels, noisy_labels, num_classes=10, split_percentage=0.9, seed=1):
+#     np.random.seed(int(seed))
+
+#     train_indices = []
+#     val_indices = []
+
+#     for i in range(num_classes):
+#         class_indices = np.where(clean_labels == i)[0]
+#         num_per_class = len(class_indices)
+
+#         if num_per_class == 0:
+#             continue  # skip if no data in this class
+
+#         np.random.shuffle(class_indices)
+#         split = int(num_per_class * split_percentage)
+#         train_indices.extend(class_indices[:split])
+#         val_indices.extend(class_indices[split:])
+
+#     train_indices = np.array(train_indices)
+#     val_indices = np.array(val_indices)
+
+#     # ✅ 슬라이싱만 수행, 변형 없음
+#     train_data = data[train_indices]
+#     val_data = data[val_indices]
+#     train_clean_labels = clean_labels[train_indices]
+#     val_clean_labels = clean_labels[val_indices]
+#     train_noisy_labels = noisy_labels[train_indices]
+#     val_noisy_labels = noisy_labels[val_indices]
+
+#     return (
+#         train_data, val_data,
+#         train_noisy_labels, val_noisy_labels,
+#         train_clean_labels, val_clean_labels
+#     )
+
 
 if __name__=='__main__':
     from torchvision import datasets, transforms

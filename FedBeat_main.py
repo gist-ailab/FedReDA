@@ -51,114 +51,68 @@ def main(args):
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
 
-    # load and balance dataset
-    print('loading dataset...')
+    # Load and prepare dataset
     train_dataset, val_dataset, test_dataset = load_data(args)
     train_dataset = wrap_as_local_dataset(train_dataset, tag='train', dataset_type='ham10000')
     val_dataset = wrap_as_local_dataset(val_dataset, tag='val', dataset_type='ham10000')
     test_dataset = wrap_as_local_dataset(test_dataset, tag='test', dataset_type='ham10000')
 
-    print('total original data counter')
-    print(Counter(np.array(train_dataset.local_clean_labels)))
-    print(Counter(np.array(val_dataset.local_clean_labels)))
-    print(Counter(np.array(test_dataset.local_clean_labels)))
-
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                               batch_size=args.batch_size,
-                                               num_workers=args.num_workers,
-                                               drop_last=False,
-                                               shuffle=True)
-
-    # used for validation
-    val_loader = torch.utils.data.DataLoader(dataset=val_dataset,
-                                             batch_size=args.batch_size,
-                                             num_workers=args.num_workers,
-                                             drop_last=False,
-                                             shuffle=True)
-
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
-                                              batch_size=args.batch_size,
-                                              num_workers=args.num_workers,
-                                              drop_last=False,
-                                              shuffle=False)
-    # clients data split
-    if args.iid:
-        train_prob = (1.0 / args.num_classes) * np.ones((args.num_clients, args.num_classes))
-    else:
-        if not os.path.exists(model_dir + '/' + 'train_prob.npy'):
-            train_prob = get_prob(args.num_clients, p=1.0)
-            np.save(model_dir + '/' + 'train_prob.npy', np.array(train_prob))
-        else:
-            train_prob = np.load(model_dir + '/' + 'train_prob.npy')
-    clients_train_loader_list = []
-    clients_train_loader_batch_list = []
-    clients_test_loader_list = []
-
-    # if args.iid:
-    #     clients_train_dataset_list = create_data(train_prob, len(train_dataset.local_data) / args.num_clients,
-    #                                              train_dataset, args.num_classes, args.dataset, args.seed)
-    #     clients_test_dataset_list = create_data(train_prob, int(len(test_dataset.local_data) / args.num_clients),
-    #                                             test_dataset, args.num_classes, args.dataset, args.seed)
-    #     clients_test_dataset_combination = combine_data(clients_test_dataset_list, args.dataset)
-    #     clients_train_dataset_combination = combine_data(clients_train_dataset_list, args.dataset)
-    # else:
-    #     # may fail due to incorrect prob
-    #     clients_train_dataset_list = create_data(train_prob,
-    #                                              int(len(train_dataset.local_data) * 0.5 / args.num_clients),
-    #                                              train_dataset, args.num_classes, args.dataset, args.seed)
-    #     clients_test_dataset_list = create_data(train_prob, int(len(test_dataset.local_data) * 0.5 / args.num_clients),
-    #                                             test_dataset, args.num_classes, args.dataset, args.seed)
-    #     clients_test_dataset_combination = combine_data(clients_test_dataset_list, args.dataset)
-    #     clients_train_dataset_combination = combine_data(clients_train_dataset_list, args.dataset)
+    print('Original data distribution (clean labels count):')
+    print(f"→ Total Train samples: {len(train_dataset)}")
+    print(f"→ Total Val samples  : {len(val_dataset)}")
+    print(f"→ Total Test samples : {len(test_dataset)}")
 
     train_subsets = split_equally_across_clients(train_dataset, args.num_clients, seed=args.seed)
+    val_subsets = split_equally_across_clients(val_dataset, args.num_clients, seed=args.seed)
     test_subsets = split_equally_across_clients(test_dataset, args.num_clients, seed=args.seed)
 
     clients_train_dataset_list = wrap_subsets_to_local_dataset(train_subsets, train_dataset)
+    clients_val_dataset_list = wrap_subsets_to_local_dataset(val_subsets, val_dataset)
     clients_test_dataset_list = wrap_subsets_to_local_dataset(test_subsets, test_dataset)
-    clients_test_dataset_combination = combine_data(clients_test_dataset_list, args.dataset)
-    clients_train_dataset_combination = combine_data(clients_train_dataset_list, args.dataset)
 
-    train_loader = torch.utils.data.DataLoader(dataset=clients_train_dataset_combination,
-                                               batch_size=args.batch_size,
-                                               num_workers=args.num_workers,
-                                               drop_last=False,
-                                               shuffle=False)
-    print('total test data counter')
-    print(Counter(clients_test_dataset_combination.local_clean_labels))
-    # used for test (i.e. only have clean labels)
-    test_loader = torch.utils.data.DataLoader(dataset=clients_test_dataset_combination,
-                                              batch_size=args.batch_size,
-                                              num_workers=args.num_workers,
-                                              drop_last=False,
-                                              shuffle=False)
+    test_loader = DataLoader(combine_data(clients_test_dataset_list, args.dataset),
+                            batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    print("\n[Client-wise Dataset Sizes]")
+    clients_train_loader_list = []
+    clients_train_class_num_list = []
+    clients_val_loader_list = []
+    clients_test_loader_list = []
+    clients_train_loader_batch_list = []
 
     for i in range(args.num_clients):
-        print('Client [%d] train and test data counter' % (i + 1))
-        print(Counter(clients_train_dataset_list[i].local_clean_labels))
-        print(Counter(clients_test_dataset_list[i].local_clean_labels))
-        print('Client [%d] train noisy data counter' % (i + 1))
-        print(Counter(clients_train_dataset_list[i].local_noisy_labels))
-        local_train_loader = torch.utils.data.DataLoader(dataset=clients_train_dataset_list[i],
-                                                         batch_size=args.batch_size,
-                                                         num_workers=args.num_workers,
-                                                         drop_last=False,
-                                                         shuffle=True)
-        # for distilling
+        print(f"Client {i+1}:")
+        print(f"  Train samples: {len(clients_train_dataset_list[i])}")
+        print(f"  Test samples : {len(clients_test_dataset_list[i])}")
+
+        train_loader = DataLoader(clients_train_dataset_list[i], batch_size=args.batch_size,
+                                shuffle=True, num_workers=args.num_workers)
+        val_loader = DataLoader(clients_val_dataset_list[i], batch_size=args.batch_size,
+                                shuffle=False, num_workers=args.num_workers)
+        
         local_train_loader_batch = torch.utils.data.DataLoader(dataset=clients_train_dataset_list[i],
                                                                batch_size=args.batch_size,
                                                                num_workers=args.num_workers,
                                                                drop_last=False,
                                                                shuffle=False)
 
-        local_test_loader = torch.utils.data.DataLoader(dataset=clients_test_dataset_list[i],
-                                                        batch_size=args.batch_size,
-                                                        num_workers=args.num_workers,
-                                                        drop_last=False,
-                                                        shuffle=True)
-        clients_train_loader_list.append(local_train_loader)
+        class_num_list = [0 for _ in range(args.num_classes)]
+        for j in range(len(clients_train_dataset_list[i])):
+            class_num_list[int(clients_train_dataset_list[i][j][1])] += 1
+        
+        # Create a tensor from class_num_list and move it to the specified device
+        class_num_tensor = torch.cuda.FloatTensor(class_num_list)
+
+        # Perform calculations
+        class_p_list = class_num_tensor / class_num_tensor.sum()
+        class_p_list = torch.log(class_p_list)
+        class_p_list = class_p_list.view(1, -1)
+        
+        clients_train_loader_list.append(train_loader)
+        clients_train_class_num_list.append(class_p_list)
         clients_train_loader_batch_list.append(local_train_loader_batch)
-        clients_test_loader_list.append(local_test_loader)
+        clients_val_loader_list.append(val_loader)
+
 
     # construct model
     print('constructing model...')
@@ -167,12 +121,9 @@ def main(args):
     if args.dataset == 'cifar10':
         classifier = model.ResNet34(10).cuda()
     if args.dataset == 'ham10000':
-        # classifier = model.ResNet34(10).cuda()
-        # DINO classifier
         model_load = dino_variant._small_dino
         variant = dino_variant._small_variant
-        pretrained = torch.hub.load('facebookresearch/dinov2', model_load)
-        dino_state_dict = pretrained.state_dict()
+        dino_state_dict = torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth')
         classifier = model_dino.ReinDinov2(variant, dino_state_dict, args.num_classes)
         classifier.eval()
 
@@ -182,7 +133,7 @@ def main(args):
     best_round = 0
     best_model_weights_list = []
     classifier.cuda()
-
+    criterion = nn.CrossEntropyLoss()
     for rd in range(args.round1):
         local_weights_list, local_acc_list = [], []
         selected_id = random.sample(range(args.num_clients), args.num_clients)
@@ -195,9 +146,8 @@ def main(args):
             train_acc = 0.
             for epoch in range(args.local_ep):
                 model_local.train()
-                optimizer_w = torch.optim.SGD(model_local.parameters(), lr=args.lr_w, momentum=args.momentum)
-                # optimizer_w = torch.optim.AdamW(model_local.parameters(), lr=args.lr_f, weight_decay=args.weight_decay)
-                train_acc = train(client_train_loader, epoch, model_local, optimizer_w, args)
+                optimizer_w = torch.optim.AdamW(model_local.parameters(), lr=args.lr_f, weight_decay=args.weight_decay)
+                train_acc = train(client_train_loader, epoch, model_local, optimizer_w, criterion, args, clients_train_class_num_list[client_id])
             local_weights_list.append(copy.deepcopy(model_local.state_dict()))
             local_acc_list.append(train_acc)
         classifier_weights = average_weights(local_weights_list)
@@ -227,8 +177,6 @@ def main(args):
     print('Loading Test Accuracy on the %s test data: Model1 %.4f %%' % (len(test_dataset), test_acc))
     distilled_dataset_clients_list = []
     distilled_loader_clients_list = []
-    # print(classifier)
-    # Bayesian ensemble
     for client_id in range(args.num_clients):
         distilled_example_index_list = []
         distilled_example_labels_list = []
@@ -241,21 +189,12 @@ def main(args):
                 var = torch.clamp(w_var[k], 1e-6)
                 eps = torch.randn_like(mean)
                 safe_var = torch.clamp(w_var[k], min=1e-6, max=1e2)
-                # print('mean : ', mean)
-                # print('save var : ', torch.sqrt(safe_var))
-                # print('eps : ', eps)
-                # print('var scale : ', var_scale)
                 mean_grad[k] = mean + torch.sqrt(safe_var) * eps * var_scale
-                # print('mean grad k 1 : ',mean_grad[k])
             for k in base_model:
                 if torch.isnan(base_model[k]).any():
                     print(f"[!] NaN in base_model[{k}]")
             for k in w_avg.keys():
-                # print('mean k ',mean_grad[k].device)
-                # print('w_norm[k] ', w_norm[k].device)
-                # print('base_model[k] ', base_model[k].device)
                 mean_grad[k] = mean_grad[k] * w_norm[k] + base_model[k]
-                # print('mean grad k 2 : ',mean_grad[k])
             teachers_list.append(copy.deepcopy(mean_grad))
         for i, (data, noisy_label, clean_label, indexes) in enumerate(clients_train_loader_batch_list[client_id]):
             data = data.cuda()
@@ -264,29 +203,37 @@ def main(args):
                 classifier.cuda()
                 classifier.eval()
                 out = classifier(data)
-                # print('out : ', out)
                 if j == 0:
                     logits1 = F.softmax(out, dim=1)
                 else:
                     logits1 = torch.add(logits1, F.softmax(out, dim=1))
             logits1 = torch.div(logits1, len(teachers_list))
             logits1_max = torch.max(logits1, dim=1)
-            # print('logits1_max : ', logits1_max)
             mask = logits1_max[0] > threshold
             distilled_example_index_list.extend(indexes[mask.cpu()])
             distilled_example_labels_list.extend(logits1_max[1].cpu()[mask.cpu()])
-        # print("Distilling finished for client [%d]" % (client_id + 1))
 
         distilled_example_index = np.array(distilled_example_index_list)
-        # print('distilled_example_labels_list : ', distilled_example_index_list)
         distilled_pseudo_labels = np.array(distilled_example_labels_list)
-        # print('distilled_example_labels_list : ', distilled_example_labels_list)
-        distilled_images = clients_train_dataset_list[client_id].local_data[distilled_example_index]
-        distilled_noisy_labels = clients_train_dataset_list[client_id].local_noisy_labels[distilled_example_index]
-        distilled_clean_labels = clients_train_dataset_list[client_id].local_clean_labels[distilled_example_index]
-        distilled_acc = (np.array(distilled_pseudo_labels) == np.array(distilled_clean_labels)).sum() / len(distilled_pseudo_labels)
-        print("Number of distilled examples:" + str(len(distilled_pseudo_labels)))
-        print("Accuracy of distilled examples collection:" + str(distilled_acc))
+
+        if len(distilled_pseudo_labels) > 0:
+            source_images = np.array(clients_train_dataset_list[client_id].local_data)
+            source_noisy_labels = np.array(clients_train_dataset_list[client_id].local_noisy_labels)
+            source_clean_labels = np.array(clients_train_dataset_list[client_id].local_clean_labels)
+
+            distilled_images = source_images[distilled_example_index]
+            distilled_noisy_labels = source_noisy_labels[distilled_example_index]
+            distilled_clean_labels = source_clean_labels[distilled_example_index]
+            
+            distilled_acc = (distilled_pseudo_labels == distilled_clean_labels).sum() / len(distilled_pseudo_labels)
+            print("Number of distilled examples:" + str(len(distilled_pseudo_labels)))
+            print("Accuracy of distilled examples collection:" + str(distilled_acc))
+        else:
+            print("Number of distilled examples: 0")
+            distilled_acc = 0
+            distilled_images = np.array([])
+            distilled_noisy_labels = np.array([])
+            distilled_clean_labels = np.array([])
 
         np.save(model_dir + '/' + str(client_id) + '_' + 'distilled_images.npy', distilled_images)
         np.save(model_dir + '/' + str(client_id) + '_' + 'distilled_pseudo_labels.npy', distilled_pseudo_labels)
@@ -298,26 +245,6 @@ def main(args):
         distilled_noisy_labels = np.load(model_dir + '/' + str(client_id) + '_' + 'distilled_noisy_labels.npy')
         distilled_pseudo_labels = np.load(model_dir + '/' + str(client_id) + '_' + 'distilled_pseudo_labels.npy')
         distilled_clean_labels = np.load(model_dir + '/' + str(client_id) + '_' + 'distilled_clean_labels.npy')
-        if args.dataset == 'cifar10':
-            distilled_dataset_ = dataset.distilled_dataset(distilled_images,
-                                                           distilled_noisy_labels,
-                                                           distilled_pseudo_labels,
-                                                           transform=transforms.Compose([
-                                                               transforms.ToTensor(),
-                                                               transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                                                                    (0.2023, 0.1994, 0.2010)), ]),
-                                                           target_transform=transform_target
-                                                           )
-        if args.dataset == 'svhn':
-            distilled_dataset_ = dataset.distilled_dataset(distilled_images,
-                                                           distilled_noisy_labels,
-                                                           distilled_pseudo_labels,
-                                                           transform=transforms.Compose([
-                                                               transforms.ToTensor(),
-                                                               transforms.Normalize((0.5, 0.5, 0.5),
-                                                                                    (0.5, 0.5, 0.5)), ]),
-                                                           target_transform=transform_target
-                                                           )
         if args.dataset == 'ham10000':
             distilled_dataset_ = dataset.distilled_dataset(distilled_images,
                                                            distilled_noisy_labels,
@@ -337,39 +264,14 @@ def main(args):
         distilled_loader_clients_list.append(train_loader_distilled)
     print('----------Finishing Distilling----------')
 
-    # torch.cuda.empty_cache()
     # Train Transition Matrix Estimation Network
     print('----------Starting Training Trans Matrix Estimation Model----------')
     classifier.load_state_dict(torch.load(model_dir + '/' + 'warmup_model.pth'))
     classifier.cuda()
-    if args.dataset == 'svhn':
-        classifier_trans = model_trans.ResNet18(100)
-        warm_up_dict = classifier.state_dict()
-        temp = OrderedDict()
-        params = classifier_trans.state_dict()
-        classifier.load_state_dict(torch.load(model_dir + '/' + 'warmup_model.pth'))
-        for name, parameter in classifier.named_parameters():
-            if name in params:
-                temp[name] = parameter
-        params.update(temp)
-        classifier_trans.load_state_dict(params)
-    if args.dataset == 'cifar10':
-        classifier_trans = model_trans.ResNet34(100)
-        warm_up_dict = classifier.state_dict()
-        temp = OrderedDict()
-        params = classifier_trans.state_dict()
-        classifier.load_state_dict(torch.load(model_dir + '/' + 'warmup_model.pth'))
-        for name, parameter in classifier.named_parameters():
-            if name in params:
-                temp[name] = parameter
-        params.update(temp)
-        classifier_trans.load_state_dict(params)
-
     if args.dataset == 'ham10000':
         model_load = dino_variant._small_dino
         variant = dino_variant._small_variant
-        pretrained = torch.hub.load('facebookresearch/dinov2', model_load)
-        dino_state_dict = pretrained.state_dict()
+        dino_state_dict = torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth')
         classifier_trans = model_dino.ReinDinov2_trans(variant, dino_state_dict, 49)
         classifier_trans.eval()
         temp = OrderedDict()
@@ -396,7 +298,7 @@ def main(args):
             for epoch in range(args.local_ep):
                 loss_trans = 0.
                 model_local_trans.train()
-                optimizer_trans = torch.optim.SGD(model_local_trans.parameters(), lr=args.lr, momentum=args.momentum)
+                optimizer_trans = torch.optim.AdamW(model_local_trans.parameters(), lr=args.lr)
                 for data, noisy_labels, pseudo_labels, index in client:
                     data = data.cuda()
                     pseudo_labels, noisy_labels = pseudo_labels.cuda(), noisy_labels.cuda()
@@ -444,8 +346,7 @@ def main(args):
             for epoch in range(args.local_ep2):
                 model_local.train()
                 classifier_trans.eval()
-                optimizer_f = torch.optim.SGD(model_local.parameters(), lr=args.lr_f, momentum=args.momentum)
-                # optimizer_f = torch.optim.Adam(model_local.parameters(), lr=args.lr_f, weight_decay=args.weight_decay)
+                optimizer_f = torch.optim.Adam(model_local.parameters(), lr=args.lr_f, weight_decay=args.weight_decay)
                 train_acc = train_forward(model_local, client_train_loader, optimizer_f, classifier_trans)
                 test_acc = evaluate(test_loader, model_local)
                 print('Round [%d] Epoch [%d] Client [%d] Test: %.4f %%' % (rd + 1, epoch + 1, client_id + 1, test_acc))
@@ -482,7 +383,6 @@ if __name__ == '__main__':
             print(save_dir + '_' + str(args.dataset) + '_' +
                      str(args.noise_rate) + '_' + str(args.tau) + '.txt')
             sys.stdout = f
-            sys.stderr = f
         print('print finished')
         print('start main')
         acc = main(args)
