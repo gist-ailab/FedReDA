@@ -21,7 +21,7 @@ if fednoro_path not in sys.path:
 from util.options import args_parser
 from dino_variant import _small_dino, _small_variant
 from rein import LoRAFusedDualReinsDinoVisionTransformer, ReinsDinoVisionTransformer, SelectiveReinsDinoVisionTransformer
-from update import average_reins, client_update_with_refinement, average_weights, PAPA_average_reins
+from update import average_reins, average_reins1, client_update_with_refinement, client_update_with_LA, average_weights, PAPA_average_reins
 import util # util.validation_accuracy를 위해 유지
 # ---------------------------
 
@@ -43,7 +43,14 @@ class DatasetSplit(Dataset):
         # FedLNL의 학습 루프는 4개의 값을 반환받으므로, 동일한 형식으로 맞춰줍니다.
         image, label = self.dataset[self.idxs[item]]
         # (inputs, targets, original_index, noisy_label_check)
-        return image, label, self.idxs[item], self.idxs[item]
+        return image, label
+    
+    def get_num_of_each_class(self, args):
+        class_sum = np.array([0] * args.n_classes)
+        for idx in self.idxs:
+            label = self.dataset.targets[idx]
+            class_sum[label] += 1
+        return class_sum.tolist()
 
 def main(args):
     device = torch.device(f"cuda:{args.gpu}")
@@ -94,17 +101,14 @@ def main(args):
         clients_train_loader_list.append(train_loader)
 
         # 클래스별 샘플 수 계산
-        class_num_list = [0] * args.num_classes
-        client_labels = [dataset_train.targets[idx] for idx in client_indices]
-        class_counts = Counter(client_labels)
-        for c, count in class_counts.items():
-            class_num_list[c] = count
+        class_num_list = client_dataset.get_num_of_each_class(args)
         
         class_num_list = torch.cuda.FloatTensor(class_num_list)
         class_p_list = class_num_list / class_num_list.sum()
-        class_p_list = torch.log(class_p_list)
+        class_p_list = torch.log(class_p_list+1e-6)
         class_p_list = class_p_list.view(1, -1)
         clients_train_class_num_list.append(class_p_list)
+        # print(class_p_list)
 
     # =============================================================================
     # == 모델 초기화 및 학습 루프 (이 부분은 기존 FedLNL_main.py와 동일) ==
@@ -118,10 +122,10 @@ def main(args):
     global_model.to(device)
     global_model.train()
     
-    print("GLOBAL MODEL NAMED PARAMETERS (requires_grad=True)")
-    for n, p in global_model.named_parameters():
-        if p.requires_grad:
-            print(n)
+    # print("GLOBAL MODEL NAMED PARAMETERS (requires_grad=True)")
+    # for n, p in global_model.named_parameters():
+    #     if p.requires_grad:
+    #         print(n)
 
     # 클라이언트 초기화
     client_model_list, optimizer_list, scheduler_list = [], [], []
@@ -131,68 +135,98 @@ def main(args):
         model.train()
         
         client_model_list.append(model)
-        optimizer_rein = torch.optim.AdamW(list(model.linear_rein.parameters())+list(model.reins.parameters()), lr=args.lr, weight_decay=args.weight_decay)
-        optimizer_rein2 = torch.optim.AdamW(list(model.linear_rein2.parameters())+list(model.reins2.parameters()), lr=args.lr_f, weight_decay=args.weight_decay)
+        optimizer_rein = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler_rein = torch.optim.lr_scheduler.MultiStepLR(optimizer_rein, milestones=[int(0.5 * args.round3), int(0.75 * args.round3), int(0.9 * args.round3)])
-        scheduler_rein2 = torch.optim.lr_scheduler.MultiStepLR(optimizer_rein2, milestones=[int(0.5 * args.round3), int(0.75 * args.round3), int(0.9 * args.round3)])
-        optimizer_list.append([optimizer_rein, optimizer_rein2])
-        scheduler_list.append([scheduler_rein, scheduler_rein2])
-
+        optimizer_list.append(optimizer_rein)
+        scheduler_list.append(scheduler_rein)
+        
     # Pretrain clients
-    print("[Step 1] Local Pretraining (reins1)")
-    for client_idx in range(args.num_clients):
-        model = client_model_list[client_idx]
-        model.train()
-        optimizer_rein, optimizer_rein2 = optimizer_list[client_idx]
-        train_loader = clients_train_loader_list[client_idx]
-
-        for ep in range(args.round1):
-            for inputs, targets, _, _ in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                feats = model.forward_features(inputs)[:, 0, :]
-                logits_rein = model.linear_rein(feats)
-                pred_rein = logits_rein.argmax(dim=1)
-                
-                feats2 = model.forward_features2(inputs)[:, 0, :]
-                logits_rein2 = model.linear_rein2(feats2)
-                
-                with torch.no_grad():
-                    linear_accurate_rein = (pred_rein == targets)
+    step1_model_path = os.path.join('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints',
+                            args.dataset,
+                            'step1_model_triple_state_dict.pth')
+    
+    if not os.path.exists(step1_model_path):
+        print("[Step 1] Local Pretraining (reins1)")
+        for ep in range(args.round1): 
+            for client_idx in range(args.num_clients):
+                model = client_model_list[client_idx]
+                model.train()
+                optimizer_rein = optimizer_list[client_idx]
+                train_loader = clients_train_loader_list[client_idx]
+                for inputs, targets in train_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
                     
-                logits_rein = logits_rein + clients_train_class_num_list[client_idx]
-                logits_rein2 = logits_rein2 + clients_train_class_num_list[client_idx]
-                
-                loss_rein = F.cross_entropy(logits_rein, targets, reduction='none')
-                loss_rein2 = F.cross_entropy(logits_rein2, targets, reduction='none')
-                
-                loss = (linear_accurate_rein * loss_rein2).mean() + loss_rein.mean()
-                
-                optimizer_rein.zero_grad()
-                optimizer_rein2.zero_grad()
-                loss.backward()
-                optimizer_rein.step()
-                optimizer_rein2.step()
+                    feats_norein = model.forward_features_no_rein(inputs)[:, 0, :]
+                    logits_norein = model.linear_norein(feats_norein)
+                    
+                    feats = model.forward_features(inputs)[:, 0, :]
+                    logits_rein = model.linear_rein(feats)
+                    
+                    feats2 = model.forward_features2(inputs)[:, 0, :]
+                    logits_rein2 = model.linear_rein2(feats2)
+                    
+                    logits_norein = logits_norein + clients_train_class_num_list[client_idx]
+                    logits_rein = logits_rein + clients_train_class_num_list[client_idx]
+                    logits_rein2 = logits_rein2 + clients_train_class_num_list[client_idx]
+                    
+                    with torch.no_grad():
+                        pred_norein = logits_norein.argmax(dim=1)
+                        pred_rein = logits_rein.argmax(dim=1)
+                        
+                        linear_accurate_norein = (pred_norein == targets)
+                        linear_accurate = (pred_rein == targets)
+                    
+                    # pred_rein = logits_rein.argmax(dim=1)
+                    # pred_rein2 = logits_rein2.argmax(dim=1)
+                    
+                    loss_norein = F.cross_entropy(logits_norein/1.2, targets, reduction='none')
+                    loss_rein = F.cross_entropy(logits_rein/1.2, targets, reduction='none')
+                    loss_rein2 = F.cross_entropy(logits_rein2/1.2, targets, reduction='none')
+                    
+                    # loss = loss_norein.mean() + \
+                    #        (linear_accurate_norein * loss_rein).mean() + \
+                    #        (linear_accurate * loss_rein2).mean()
+                           
+                    loss = loss_norein.mean() + \
+                           loss_rein.mean() + \
+                           loss_rein2.mean()
+                    
+                    optimizer_rein.zero_grad()
+                    loss.backward()
+                    optimizer_rein.step()
 
-            if ep == args.round1 - 1:
-                bacc, nacc = util.validation_accuracy(model, test_loader, device, mode='rein2')
-                print(f"[Client {client_idx+1}] Epoch {ep+1}: Rein2 Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
-
-    # Aggregation 후 평가
-    print("[Step 2] Aggregation of reins and linear head")
-    average_reins(global_model, client_model_list)
-    bacc, nacc = util.validation_accuracy(global_model, test_loader, device, mode='rein2')
-    print(f"[Eval after Aggregation] Rein2 Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
-    bacc, nacc = util.validation_accuracy(global_model, test_loader, device, mode='no_rein')
-    print(f"[Eval after Aggregation] No Rein Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
-
-    # Federated Refinement
+                # if ep == args.round1 - 1:
+                #     bacc, nacc = util.validation_accuracy(model, test_loader, device, mode='rein')
+                #     print(f"[Client {client_idx+1}] Epoch {ep+1}: Rein2 Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
+            average_reins(global_model, client_model_list)
+            bacc, nacc = util.validation_accuracy(global_model, test_loader, device, mode='no_rein')
+            print(f"[Eval after Aggregation] Rein Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
+            bacc, nacc = util.validation_accuracy(global_model, test_loader, device, mode='rein')
+            print(f"[Eval after Aggregation] Rein Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
+            bacc, nacc = util.validation_accuracy(global_model, test_loader, device, mode='rein2')
+            print(f"[Eval after Aggregation] Rein2 Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
+            
+        # print("[Step 2] Aggregation of reins and linear head")
+        # average_reins1(global_model, client_model_list)
+        # bacc, nacc = util.validation_accuracy(global_model, test_loader, device, mode='rein')
+        # print(f"[Eval after Aggregation] Rein2 Test bAcc = {bacc * 100:.2f}% nAcc = {nacc * 100:.2f}%")
+        
+        torch.save(global_model.state_dict(), 
+                os.path.join('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints',
+                                args.dataset,
+                                'step1_model_triple_state_dict.pth'))
+    else:
+        model_state_dict = torch.load(step1_model_path)
+        global_model.load_state_dict(model_state_dict)
+        for client_idx in range(args.num_clients):
+            model = client_model_list[client_idx]
+            model.load_state_dict(model_state_dict)
+    
     class_total = [1] * args.num_classes
     dynamic_boost_list = [torch.zeros(args.num_classes, device=device) for _ in range(args.num_clients)]
     Final_acc_Rein1 = 0
-    Final_acc_Rein2 = 0
     
-    print("[Step 3] Federated Refinement")
+    print("[Step 2] Federated Refinement")
     for round_num in range(args.round3):
         print(f"→ Global Round {round_num + 1}/{args.round3}")
         mix_ratio = args.mixhigh - (args.mixhigh - args.mixlow) * round_num / args.round3
@@ -200,31 +234,34 @@ def main(args):
         for client_idx in range(args.num_clients):
             for _ in range(args.local_ep):
                 client = client_model_list[client_idx]
+                
+                client.reins2 = copy.deepcopy(global_model.reins)
+                for param in client.reins2.parameters():
+                    param.requires_grad = False
+                
                 optimizers = optimizer_list[client_idx]
                 train_loader = clients_train_loader_list[client_idx]
-                class_total, dynamic_boost = client_update_with_refinement(client, global_model, optimizers, train_loader, config, mix_ratio, class_total, 
+                class_total, dynamic_boost = client_update_with_LA(client, global_model, optimizers, train_loader, config, mix_ratio, class_total, 
                                                                            class_p_list=clients_train_class_num_list[client_idx], dynamic_boost=dynamic_boost_list[client_idx])
-                dynamic_boost_list[client_idx] = 0.9 * dynamic_boost_list[client_idx] + 0.1 * dynamic_boost
+                dynamic_boost_list[client_idx] = 0.5 * dynamic_boost_list[client_idx] + 0.5 * dynamic_boost
             
-            scheduler_list[client_idx][0].step()
-            scheduler_list[client_idx][1].step()
-            
+            # scheduler_list[client_idx].step()
+
         average_reins(global_model, client_model_list)
         
+        bacc1, nacc1 = util.validation_accuracy(global_model, test_loader, device, mode='no_rein')
+        print(f"[Global Eval Linear after Round {round_num + 1}] BAccuracy: {bacc1 * 100:.2f}% NAccuracy: {nacc1 * 100:.2f}%")
         bacc1, nacc1 = util.validation_accuracy(global_model, test_loader, device, mode='rein')
         print(f"[Global Eval Rein after Round {round_num + 1}] BAccuracy: {bacc1 * 100:.2f}% NAccuracy: {nacc1 * 100:.2f}%") 
-        bacc2, nacc2 = util.validation_accuracy(global_model, test_loader, device, mode='rein2')
-        print(f"[Global Eval Rein2 after Round {round_num + 1}] BAccuracy: {bacc2 * 100:.2f}% NAccuracy: {nacc2 * 100:.2f}%") 
-
+        bacc1, nacc1 = util.validation_accuracy(global_model, test_loader, device, mode='rein2')
+        print(f"[Global Eval Rein after Round {round_num + 1}] BAccuracy: {bacc1 * 100:.2f}% NAccuracy: {nacc1 * 100:.2f}%") 
+        
         if round_num + 1 > args.round3 - 10:
             Final_acc_Rein1 += bacc1
-            Final_acc_Rein2 += bacc2
-
+            
     Final_acc_Rein1 /= 10
-    Final_acc_Rein2 /= 10
     print(f"[Final Eval] Average BAcc over last 10 rounds (Rein1): {Final_acc_Rein1 * 100:.2f}%")
-    print(f"[Final Eval] Average BAcc over last 10 rounds (Rein2): {Final_acc_Rein2 * 100:.2f}%")
-
+    
 if __name__ == "__main__":
     args = args_parser()
     torch.cuda.set_device(args.gpu)

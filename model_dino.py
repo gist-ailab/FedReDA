@@ -41,8 +41,17 @@ class ReinDinov2(nn.Module):
         self.backbone.linear_rein = nn.Linear(variant['embed_dim'], num_classes)
 
     def forward(self, x):
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"[NaN detected] Input contains NaN/Inf. shape={x.shape}, "
+                  f"min={x.min().item()}, max={x.max().item()}")
         feats = self.backbone.forward_features(x)
+        if torch.isnan(feats).any() or torch.isinf(feats).any():
+            print(f"[NaN detected] feats contain NaN/Inf. "
+                  f"min={feats.min().item()}, max={feats.max().item()}")
         logits = self.backbone.linear_rein(feats[:, 0, :])
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print(f"[NaN detected] logits contain NaN/Inf. "
+                  f"min={logits.min().item()}, max={logits.max().item()}")
         return logits
     
     def forward_wfeat(self, x):
@@ -63,12 +72,13 @@ class ReinDinov2_trans(nn.Module):
         super().__init__()
         self.backbone = ReinsDinoVisionTransformer(**variant)
         self.backbone.load_state_dict(dino_state_dict, strict=False)
-        self.backbone.bayes_linear = nn.Linear(variant['embed_dim'], num_classes)
+        self.backbone.bayes_linear = nn.Linear(variant['embed_dim'], num_classes*num_classes)
+        self.num_classes = num_classes
 
     def forward(self, x):
         feats = self.backbone.forward_features(x)
         logits = self.backbone.bayes_linear(feats[:, 0, :])
-        logits = logits.reshape(logits.size(0),7,7)
+        logits = logits.reshape(logits.size(0),self.num_classes,self.num_classes)
         logits = F.softmax(logits, dim=2)
         return logits
     

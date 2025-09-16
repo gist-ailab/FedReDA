@@ -14,6 +14,9 @@ from tqdm import tqdm
 from PIL import Image
 from util import dataset
 import torch.nn as nn
+import logging
+import pandas as pd
+import random
 
 class LogitAdjust(nn.Module):
     def __init__(self, cls_num_list, tau=1, weight=None):
@@ -93,26 +96,104 @@ def read_conf(json_path):
         config = json.load(json_file)
     return config
 
-def add_noise(args, y_train, dict_users):
+def add_noise(args, y_train, dict_users, total_dataset, cache_path='/home/work/Workspaces/yunjae_heo/FedLNL/other_repos/FedNoRo/data/ICH_softlabel.csv'):
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
 
-    gamma_s = np.random.binomial(1, args.noisy_client_rate, args.num_users)
+    gamma_s = np.array([0.] * args.num_users)
+    gamma_s[:int(args.level_n_system * args.num_users)] = 1.
+    np.random.shuffle(gamma_s)
     gamma_c_initial = np.random.rand(args.num_users)
-    gamma_c_initial = (1 - args.min_noisy_level) * gamma_c_initial + args.min_noisy_level
+    gamma_c_initial = (args.level_n_upperb - args.level_n_lowerb) * gamma_c_initial + args.level_n_lowerb
     gamma_c = gamma_s * gamma_c_initial
-
     y_train_noisy = copy.deepcopy(y_train)
 
-    real_noise_level = np.zeros(args.num_users)
-    for i in np.where(gamma_c > 0)[0]:
-        sample_idx = np.array(list(dict_users[i]))
-        prob = np.random.rand(len(sample_idx))
-        noisy_idx = np.where(prob <= gamma_c[i])[0]
-        y_train_noisy[sample_idx[noisy_idx]] = np.random.randint(0, 10, len(noisy_idx))
-        noise_ratio = np.mean(y_train[sample_idx] != y_train_noisy[sample_idx])
-        print("Client %d, noise level: %.4f (%.4f), real noise ratio: %.4f" % (
-            i, gamma_c[i], gamma_c[i] * 0.9, noise_ratio))
-        real_noise_level[i] = noise_ratio
+    # === Soft Label CSV 생성 또는 로딩 ===
+    if args.n_type == "instance":
+        if not os.path.exists(cache_path):
+            logging.info(f"{cache_path} not found. Generating soft label CSV from clean data...")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            soft_label_all = np.zeros((len(total_dataset), args.n_classes))
+            for client_id in np.where(gamma_s > 0)[0]:
+                sample_idx = list(dict_users[client_id])
+                client_subset = Subset(total_dataset, sample_idx)
+
+                # 기본 annotator 모델
+                model = models.resnet18(pretrained=False)
+                model.fc = nn.Linear(model.fc.in_features, args.n_classes)
+
+                # 데이터 전처리 확인 필요
+                if hasattr(total_dataset, 'transform'):
+                    client_subset.dataset.transform = transforms.Compose([
+                        transforms.Resize(256),
+                        transforms.CenterCrop(224),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+                    ])
+
+                dataloader = DataLoader(client_subset, batch_size=32, shuffle=True)
+                trained_model = train_annotator(model, dataloader, device, epochs=10)
+
+                # 확률 벡터 예측
+                soft_labels = generate_soft_labels(trained_model, client_subset, device)
+                soft_label_all[sample_idx] = soft_labels
+
+            # soft label 저장
+            image_ids = [total_dataset[i][2] if len(total_dataset[i]) > 2 else f"id_{i}" for i in range(len(total_dataset))]  # ID 컬럼 추출
+            df_soft = pd.DataFrame(soft_label_all, columns=[f"class{i+1}" for i in range(args.n_classes)])
+            df_soft.insert(0, "id", image_ids)
+            df_soft.to_csv(cache_path, index=False)
+            logging.info(f"Soft label saved to {cache_path}")
+
+        df = pd.read_csv(cache_path)
+        soft_label = df.iloc[:, 1:args.n_classes+1].values.astype("float")
+
+        real_noise_level = np.zeros(args.num_users)
+        for i in np.where(gamma_c > 0)[0]:
+            sample_idx = np.array(list(dict_users[i]))
+            soft_label_this_client = soft_label[sample_idx]
+            hard_label_this_client = y_train[sample_idx]
+
+            p_t = copy.deepcopy(soft_label_this_client[np.arange(
+                soft_label_this_client.shape[0]), hard_label_this_client])
+            p_f = 1 - p_t
+            p_f = p_f / p_f.sum()
+            noisy_idx = np.random.choice(np.arange(len(sample_idx)), size=int(
+                gamma_c[i]*len(sample_idx)), replace=False, p=p_f)
+
+            for j in noisy_idx:
+                soft_label_this_client[j][hard_label_this_client[j]] = 0.
+                soft_label_this_client[j] = soft_label_this_client[j] / \
+                    soft_label_this_client[j].sum()
+                y_train_noisy[sample_idx[j]] = np.random.choice(
+                    np.arange(args.n_classes), p=soft_label_this_client[j])
+
+            noise_ratio = np.mean(
+                y_train[sample_idx] != y_train_noisy[sample_idx])
+            logging.info("Client %d, noise level: %.4f, real noise ratio: %.4f" % (
+                i, gamma_c[i], noise_ratio))
+            real_noise_level[i] = noise_ratio
+
+    elif args.n_type == "random":
+        real_noise_level = np.zeros(args.num_users)
+        for i in np.where(gamma_c > 0)[0]:
+            sample_idx = np.array(list(dict_users[i]))
+            prob = np.random.rand(len(sample_idx))
+            noisy_idx = np.where(prob <= gamma_c[i])[0]
+            y_train_noisy[sample_idx[noisy_idx]] = np.random.randint(
+                0, args.n_classes, len(noisy_idx))
+            noise_ratio = np.mean(
+                y_train[sample_idx] != y_train_noisy[sample_idx])
+            logging.info("Client %d, noise level: %.4f, real noise ratio: %.4f" % (
+                i, gamma_c[i], noise_ratio))
+            real_noise_level[i] = noise_ratio
+
+    else:
+        raise NotImplementedError
+
     return (y_train_noisy, gamma_s, real_noise_level)
 
 
@@ -141,7 +222,6 @@ def get_output(loader, net, args, latent=False, criterion=None):
         return output_whole, loss_whole
     else:
         return output_whole
-
 
 def lid_term(X, batch, k=20):
     eps = 1e-6
@@ -347,7 +427,7 @@ def load_data(args):
                                                            transforms.ToTensor(),
                                                            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), ]),
                                                  target_transform=transform_target)
-        
+    
     if args.dataset == 'ham10000':
         train_transform, test_transform = get_transform()
         train_dataset = dataset.ham10000_dataset(True,
@@ -972,3 +1052,10 @@ if __name__=='__main__':
     )
 
     print(len(noisy_labels))
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)

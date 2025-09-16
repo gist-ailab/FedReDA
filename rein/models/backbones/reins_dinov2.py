@@ -34,6 +34,14 @@ class ReinsDinoVisionTransformer(DinoVisionTransformer):
             x = blk(x)
         return x
 
+    def forward_features_widx(self, x, idxs, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            if idx in idxs:
+                x = self.reins.forward(x, idx, batch_first=True, has_cls_token=True)
+        return x
+    
     def train(self, mode: bool = True):
         if not mode:
             return super().train(mode)

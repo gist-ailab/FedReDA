@@ -6,104 +6,188 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torch.backends.cudnn as cudnn
-import torch.utils.data as Data
 import sys
+sys.path.append('/home/work/Workspaces/yunjae_heo/FedLNL/')
+sys.path.append('/home/work/Workspaces/yunjae_heo/FedLNL/other_repos/FedNoRo/')
 import numpy as np
 import copy
 import random
-
 from collections import OrderedDict, Counter
-from util import util
-from util.util import *
-from torch.utils.data import DataLoader
-from util import dataset
-from util.options import args_parser
-from util.util import get_prob, create_data, balance_data, combine_data, load_data, transform_target, wrap_as_local_dataset
-
-from rein import *
-import update
-import model
-import model_trans
-import model_dino
-import dino_variant
-from update import train, average_weights, average_weights_weighted, evaluate, train_forward
+from torch.utils.data import DataLoader, Dataset
+from util.util import add_noise, set_seed
+from dataset.dataset import get_dataset
+from model_dino import ReinDinov2, ReinDinov2_trans
+from dino_variant import _small_variant
+import argparse
+# from util.averaging import average_weights, average_weights_weighted
+from update import train, evaluate, train_forward
 from ensemble import compute_var, compute_mean_sq
+import dataset.dataset as dataset
+from PIL import Image
 
-args = args_parser()
-torch.cuda.set_device(args.gpu)
-cudnn.benchmark = True
+def average_weights(w):
+    """
+    Returns the average of the weights.
+    """
+    w_avg = copy.deepcopy(w[0])
+    for key in w_avg.keys():
+        for i in range(1, len(w)):
+            w_avg[key] += w[i][key]
+        w_avg[key] = torch.div(w_avg[key], len(w))
+    return w_avg
 
-# result path
-save_dir = args.result_dir + '/' + args.dataset + '/iid_' + str(args.iid)
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
+def average_weights_weighted(w, dataset_list):
+    """
+    Returns the weighted average of the weights.
+    """
+    w_avg = copy.deepcopy(w[0])
+    total = 0.
+    num_list = []
+    for i in range(len(w)):
+        num_list.append(len(dataset_list[i]))
+        total += len(dataset_list[i])
+    for key in w_avg.keys():
+        w_avg[key] *= num_list[0]
+        for i in range(1, len(w)):
+            w_avg[key] += w[i][key] * num_list[i]
+        w_avg[key] = torch.div(w_avg[key], total)
+    return w_avg
+
+def args_parser():
+    parser = argparse.ArgumentParser()
+
+    # system setting
+    parser.add_argument('--deterministic', type=int,  default=1,
+                        help='whether use deterministic training')
+    parser.add_argument('--seed', type=int,  default=0, help='random seed')
+    parser.add_argument('--gpu', type=str,  default='0', help='GPU to use')
+    parser.add_argument('--num_workers', type=int, default=4, help="num_workers")
+    parser.add_argument('--result_dir', type=str, default='./results/', help="results dir")
+    parser.add_argument('--noise_rate', type=float, default=1.0, help="noise rate")
+
+
+    # basic setting
+    parser.add_argument('--exp', type=str,
+                        default='Fed', help='experiment name')
+    parser.add_argument('--dataset', type=str,
+                        default='ich', help='dataset name')
+    parser.add_argument('--model', type=str,
+                        default='ReinDinov2', help='model name')
+    parser.add_argument('--batch_size', type=int,
+                        default=16, help='batch_size per gpu')
+    parser.add_argument('--base_lr', type=float,  default=3e-4,
+                        help='base learning rate')
+    parser.add_argument('--pretrained', type=int,  default=1)
+    parser.add_argument('--n_classes', type=int, default=5, help="number of classes")
+
+
+    # for FL
+    parser.add_argument('--n_clients', type=int,  default=20,
+                        help='number of users') 
+    parser.add_argument('--iid', type=int, default=0, help="i.i.d. or non-i.i.d.")
+    parser.add_argument('--non_iid_prob_class', type=float,
+                        default=0.9, help='parameter for non-iid')
+    parser.add_argument('--alpha_dirichlet', type=float,
+                        default=2.0, help='parameter for non-iid')
+    parser.add_argument('--local_ep', type=int, default=5, help='local epoch')
+    parser.add_argument('--round1', type=int,  default=1, help='rounds')
+    parser.add_argument('--round2', type=int,  default=10, help='rounds')
+    parser.add_argument('--round3', type=int,  default=50, help='rounds')
+
+
+
+    parser.add_argument('--s1', type=int,  default=10, help='stage 1 rounds')
+    parser.add_argument('--begin', type=int,  default=10, help='ramp up begin')
+    parser.add_argument('--end', type=int,  default=49, help='ramp up end')
+    parser.add_argument('--a', type=float,  default=0.8, help='a')
+    parser.add_argument('--warm', type=int,  default=1)
+
+    # noise
+    parser.add_argument('--level_n_system', type=float, default=1.0, help="fraction of noisy clients")
+    parser.add_argument('--level_n_lowerb', type=float, default=0.3, help="lower bound of noise level")
+    parser.add_argument('--level_n_upperb', type=float, default=0.5, help="upper bound of noise level")
+    parser.add_argument('--n_type', type=str, default="instance", help="type of noise")
+
+    # FedBeat specific arguments
+    parser.add_argument('--num_exp', type=int, default=1, help='number of experiments')
+    parser.add_argument('--print_txt', type=bool, default=True, help='print txt')
+    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate for fine-tuning')
+    parser.add_argument('--lr_f', type=float, default=1e-3, help='learning rate for fine-tuning')
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--tau', type=float, help='threshold', default=0.4)
+    parser.add_argument('--local_ep2', type=int, help='number of local epochs for finetuning', default=5)
+    parser.add_argument('--trans_rounds', type=int, default=50, help='rounds for training transition matrix estimation')
+    
+    args = parser.parse_args()
+    return args
+
+class DatasetSplit(Dataset):
+    def __init__(self, dataset, idxs, clean_labels):
+        self.dataset = dataset
+        self.idxs = list(idxs)
+        self.clean_labels = clean_labels
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, item):
+        image, label = self.dataset[self.idxs[item]]
+        clean_label = self.clean_labels[self.idxs[item]]
+        return image, label, clean_label, self.idxs[item]
 
 def main(args):
     # seed
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
+    if args.deterministic:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
+        cudnn.benchmark = False
+        cudnn.deterministic = True
 
-    print(args)
-    # model path
-    model_dir = save_dir + str(args.seed) + '_rate_' + str(args.noise_rate) + '_threshold_' + str(args.tau)
+    save_dir = os.path.join(args.result_dir, args.dataset, 'iid_' + str(args.iid))
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        
+    model_dir = os.path.join(save_dir, str(args.seed) + '_rate_' + str(args.noise_rate) + '_threshold_' + str(args.tau))
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
 
     # Load and prepare dataset
-    train_dataset, val_dataset, test_dataset = load_data(args)
-    train_dataset = wrap_as_local_dataset(train_dataset, tag='train', dataset_type='ham10000')
-    val_dataset = wrap_as_local_dataset(val_dataset, tag='val', dataset_type='ham10000')
-    test_dataset = wrap_as_local_dataset(test_dataset, tag='test', dataset_type='ham10000')
+    dataset_train, dataset_test, dict_users = get_dataset(args)
+    print(f"train: {Counter(dataset_train.targets)}, total: {len(dataset_train.targets)}")
+    print(f"test: {Counter(dataset_test.targets)}, total: {len(dataset_test.targets)}")
 
-    print('Original data distribution (clean labels count):')
-    print(f"→ Total Train samples: {len(train_dataset)}")
-    print(f"→ Total Val samples  : {len(val_dataset)}")
-    print(f"→ Total Test samples : {len(test_dataset)}")
+    y_train = np.array(dataset_train.targets)
+    y_train_noisy, _, _ = add_noise(
+        args, y_train, dict_users, total_dataset=dataset_train)
+    original_targets = dataset_train.targets
+    dataset_train.targets = y_train_noisy
 
-    train_subsets = split_equally_across_clients(train_dataset, args.num_clients, seed=args.seed)
-    val_subsets = split_equally_across_clients(val_dataset, args.num_clients, seed=args.seed)
-    test_subsets = split_equally_across_clients(test_dataset, args.num_clients, seed=args.seed)
-
-    clients_train_dataset_list = wrap_subsets_to_local_dataset(train_subsets, train_dataset)
-    clients_val_dataset_list = wrap_subsets_to_local_dataset(val_subsets, val_dataset)
-    clients_test_dataset_list = wrap_subsets_to_local_dataset(test_subsets, test_dataset)
-
-    test_loader = DataLoader(combine_data(clients_test_dataset_list, args.dataset),
+    test_loader = DataLoader(dataset_test,
                             batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     print("\n[Client-wise Dataset Sizes]")
     clients_train_loader_list = []
     clients_train_class_num_list = []
-    clients_val_loader_list = []
-    clients_test_loader_list = []
     clients_train_loader_batch_list = []
 
-    for i in range(args.num_clients):
-        print(f"Client {i+1}:")
-        print(f"  Train samples: {len(clients_train_dataset_list[i])}")
-        print(f"  Test samples : {len(clients_test_dataset_list[i])}")
-
-        train_loader = DataLoader(clients_train_dataset_list[i], batch_size=args.batch_size,
+    for i in range(args.n_clients):
+        train_loader = DataLoader(DatasetSplit(dataset_train, dict_users[i], original_targets), batch_size=args.batch_size,
                                 shuffle=True, num_workers=args.num_workers)
-        val_loader = DataLoader(clients_val_dataset_list[i], batch_size=args.batch_size,
-                                shuffle=False, num_workers=args.num_workers)
         
-        local_train_loader_batch = torch.utils.data.DataLoader(dataset=clients_train_dataset_list[i],
+        local_train_loader_batch = torch.utils.data.DataLoader(dataset=DatasetSplit(dataset_train, dict_users[i], original_targets),
                                                                batch_size=args.batch_size,
                                                                num_workers=args.num_workers,
                                                                drop_last=False,
                                                                shuffle=False)
 
-        class_num_list = [0 for _ in range(args.num_classes)]
-        for j in range(len(clients_train_dataset_list[i])):
-            class_num_list[int(clients_train_dataset_list[i][j][1])] += 1
+        class_num_list = [0 for _ in range(args.n_classes)]
+        for idx in dict_users[i]:
+            class_num_list[int(dataset_train.targets[idx])] += 1
         
-        # Create a tensor from class_num_list and move it to the specified device
         class_num_tensor = torch.cuda.FloatTensor(class_num_list)
 
-        # Perform calculations
         class_p_list = class_num_tensor / class_num_tensor.sum()
         class_p_list = torch.log(class_p_list)
         class_p_list = class_p_list.view(1, -1)
@@ -111,21 +195,13 @@ def main(args):
         clients_train_loader_list.append(train_loader)
         clients_train_class_num_list.append(class_p_list)
         clients_train_loader_batch_list.append(local_train_loader_batch)
-        clients_val_loader_list.append(val_loader)
-
 
     # construct model
     print('constructing model...')
-    if args.dataset == 'svhn':
-        classifier = model.ResNet18(10).cuda()
-    if args.dataset == 'cifar10':
-        classifier = model.ResNet34(10).cuda()
-    if args.dataset == 'ham10000':
-        model_load = dino_variant._small_dino
-        variant = dino_variant._small_variant
-        dino_state_dict = torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth')
-        classifier = model_dino.ReinDinov2(variant, dino_state_dict, args.num_classes)
-        classifier.eval()
+    variant = _small_variant
+    dino_state_dict = torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth', weights_only=False)
+    classifier = ReinDinov2(variant=variant, dino_state_dict=dino_state_dict, num_classes=args.n_classes)
+    classifier.eval()
 
     # Warm Up
     print('----------Starting Warm Up Classifier Model----------')
@@ -136,7 +212,7 @@ def main(args):
     criterion = nn.CrossEntropyLoss()
     for rd in range(args.round1):
         local_weights_list, local_acc_list = [], []
-        selected_id = random.sample(range(args.num_clients), args.num_clients)
+        selected_id = random.sample(range(args.n_clients), args.n_clients)
         selected_clients_train_loader_list = [clients_train_loader_list[i] for i in selected_id]
 
         for client_id, client_train_loader in zip(selected_id, selected_clients_train_loader_list):
@@ -152,21 +228,21 @@ def main(args):
             local_acc_list.append(train_acc)
         classifier_weights = average_weights(local_weights_list)
         classifier.load_state_dict(classifier_weights)
-        val_acc = evaluate(val_loader, classifier)
-        train_acc = evaluate(train_loader, classifier)
+        val_acc = evaluate(test_loader, classifier)
+        train_acc = evaluate(clients_train_loader_list[0], classifier)
         print('Warm up Round [%d] Train Acc %.4f %% and Val Accuracy on the %s val data: Model1 %.4f %%' % (
-            rd + 1, train_acc, len(val_dataset), val_acc))
+            rd + 1, train_acc, len(dataset_test), val_acc))
         if val_acc > best_acc:
             best_acc = val_acc
             best_round = rd + 1
             best_model_weights_list = copy.deepcopy(local_weights_list)
-            torch.save(classifier.state_dict(), model_dir + '/' + 'warmup_model.pth')
+            torch.save(classifier.state_dict(), os.path.join(model_dir, 'warmup_model.pth'))
     print('Best Round [%d]' % best_round)
     print('----------Finishing Warm Up Classifier Model----------')
 
     # Distill
     print('----------Start Distilling----------')
-    classifier.load_state_dict(torch.load(model_dir + '/' + 'warmup_model.pth',weights_only=True))
+    classifier.load_state_dict(torch.load(os.path.join(model_dir, 'warmup_model.pth'),weights_only=True))
     classifier.cuda()
     base_model = copy.deepcopy(classifier.state_dict())
     w_avg, w_sq_avg, w_norm = compute_mean_sq(best_model_weights_list, base_model)
@@ -174,15 +250,15 @@ def main(args):
     threshold = args.tau
     var_scale = 0.1
     test_acc = evaluate(test_loader, classifier)
-    print('Loading Test Accuracy on the %s test data: Model1 %.4f %%' % (len(test_dataset), test_acc))
+    print('Loading Test Accuracy on the %s test data: Model1 %.4f %%' % (len(dataset_test), test_acc))
     distilled_dataset_clients_list = []
     distilled_loader_clients_list = []
-    for client_id in range(args.num_clients):
+    for client_id in range(args.n_clients):
         distilled_example_index_list = []
         distilled_example_labels_list = []
         classifier.eval()
         teachers_list = []
-        for j in range(args.num_clients):
+        for j in range(args.n_clients):
             mean_grad = copy.deepcopy(w_avg)
             for k in w_avg.keys():
                 mean = w_avg[k]
@@ -202,7 +278,9 @@ def main(args):
                 classifier.load_state_dict(teachers_list[j], strict=False)
                 classifier.cuda()
                 classifier.eval()
-                out = classifier(data)
+                with torch.inference_mode(), torch.cuda.amp.autocast(enabled=True):  # ← 추가
+                    out = classifier(data)
+                # out = classifier(data)
                 if j == 0:
                     logits1 = F.softmax(out, dim=1)
                 else:
@@ -217,13 +295,19 @@ def main(args):
         distilled_pseudo_labels = np.array(distilled_example_labels_list)
 
         if len(distilled_pseudo_labels) > 0:
-            source_images = np.array(clients_train_dataset_list[client_id].local_data)
-            source_noisy_labels = np.array(clients_train_dataset_list[client_id].local_noisy_labels)
-            source_clean_labels = np.array(clients_train_dataset_list[client_id].local_clean_labels)
+            # source_images = np.array(dataset_train.data)[distilled_example_index]
+            # source_images = np.array(dataset_train.images)[distilled_example_index]
 
-            distilled_images = source_images[distilled_example_index]
-            distilled_noisy_labels = source_noisy_labels[distilled_example_index]
-            distilled_clean_labels = source_clean_labels[distilled_example_index]
+            src_imgs = [dataset_train[i][0].numpy() for i in distilled_example_index]
+            source_noisy_labels = np.array(dataset_train.targets)[distilled_example_index]
+            source_clean_labels = np.array(original_targets)[distilled_example_index]
+            
+            print("Unique shapes:", {tuple(a.shape) for a in src_imgs})
+            
+            # distilled_images = source_images
+            distilled_images = np.stack(src_imgs, axis=0).astype(np.uint8)  # 또는 .astype(np.float32)
+            distilled_noisy_labels = source_noisy_labels
+            distilled_clean_labels = source_clean_labels
             
             distilled_acc = (distilled_pseudo_labels == distilled_clean_labels).sum() / len(distilled_pseudo_labels)
             print("Number of distilled examples:" + str(len(distilled_pseudo_labels)))
@@ -235,53 +319,52 @@ def main(args):
             distilled_noisy_labels = np.array([])
             distilled_clean_labels = np.array([])
 
-        np.save(model_dir + '/' + str(client_id) + '_' + 'distilled_images.npy', distilled_images)
-        np.save(model_dir + '/' + str(client_id) + '_' + 'distilled_pseudo_labels.npy', distilled_pseudo_labels)
-        np.save(model_dir + '/' + str(client_id) + '_' + 'distilled_noisy_labels.npy', distilled_noisy_labels)
-        np.save(model_dir + '/' + str(client_id) + '_' + 'distilled_clean_labels.npy', distilled_clean_labels)
+        np.save(os.path.join(model_dir, str(client_id) + '_' + 'distilled_images.npy'), distilled_images)
+        np.save(os.path.join(model_dir, str(client_id) + '_' + 'distilled_pseudo_labels.npy'), distilled_pseudo_labels)
+        np.save(os.path.join(model_dir, str(client_id) + '_' + 'distilled_noisy_labels.npy'), distilled_noisy_labels)
+        np.save(os.path.join(model_dir, str(client_id) + '_' + 'distilled_clean_labels.npy'), distilled_clean_labels)
 
         print('building distilled dataset')
-        distilled_images = np.load(model_dir + '/' + str(client_id) + '_' + 'distilled_images.npy')
-        distilled_noisy_labels = np.load(model_dir + '/' + str(client_id) + '_' + 'distilled_noisy_labels.npy')
-        distilled_pseudo_labels = np.load(model_dir + '/' + str(client_id) + '_' + 'distilled_pseudo_labels.npy')
-        distilled_clean_labels = np.load(model_dir + '/' + str(client_id) + '_' + 'distilled_clean_labels.npy')
-        if args.dataset == 'ham10000':
-            distilled_dataset_ = dataset.distilled_dataset(distilled_images,
-                                                           distilled_noisy_labels,
-                                                           distilled_pseudo_labels,
-                                                           transform=transforms.Compose([
-                                                               transforms.ToTensor(),
-                                                               transforms.Normalize((0.485, 0.456, 0.406),
-                                                                                    (0.229, 0.224, 0.225)), ]),
-                                                           target_transform=transform_target
-                                                           )
+        distilled_images = np.load(os.path.join(model_dir, str(client_id) + '_' + 'distilled_images.npy'))
+        distilled_noisy_labels = np.load(os.path.join(model_dir, str(client_id) + '_' + 'distilled_noisy_labels.npy'))
+        distilled_pseudo_labels = np.load(os.path.join(model_dir, str(client_id) + '_' + 'distilled_pseudo_labels.npy'))
+        distilled_clean_labels = np.load(os.path.join(model_dir, str(client_id) + '_' + 'distilled_clean_labels.npy'))
+        
+        distilled_dataset_ = dataset.distilled_dataset(distilled_images,
+                                                        distilled_noisy_labels,
+                                                        distilled_pseudo_labels,
+                                                        transform=transforms.Compose([
+                                                                transforms.ToTensor(),
+                                                                transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                                                                    (0.2023, 0.1994, 0.2010)), ]),
+                                                        )
         distilled_dataset_clients_list.append(distilled_dataset_)
-        train_loader_distilled = torch.utils.data.DataLoader(dataset=distilled_dataset_,
-                                                             batch_size=args.batch_size,
-                                                             num_workers=args.num_workers,
-                                                             drop_last=False,
-                                                             shuffle=True)
+        if len(distilled_dataset_) > 0:
+            train_loader_distilled = torch.utils.data.DataLoader(dataset=distilled_dataset_,
+                                                                batch_size=args.batch_size,
+                                                                num_workers=args.num_workers,
+                                                                drop_last=False,
+                                                                shuffle=True)
+        else:
+            train_loader_distilled = []
         distilled_loader_clients_list.append(train_loader_distilled)
     print('----------Finishing Distilling----------')
 
     # Train Transition Matrix Estimation Network
     print('----------Starting Training Trans Matrix Estimation Model----------')
-    classifier.load_state_dict(torch.load(model_dir + '/' + 'warmup_model.pth'))
+    classifier.load_state_dict(torch.load(os.path.join(model_dir, 'warmup_model.pth')))
     classifier.cuda()
-    if args.dataset == 'ham10000':
-        model_load = dino_variant._small_dino
-        variant = dino_variant._small_variant
-        dino_state_dict = torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth')
-        classifier_trans = model_dino.ReinDinov2_trans(variant, dino_state_dict, 49)
-        classifier_trans.eval()
-        temp = OrderedDict()
-        params = classifier_trans.state_dict()
-        classifier.load_state_dict(torch.load(model_dir + '/' + 'warmup_model.pth'))
-        for name, parameter in classifier.named_parameters():
-            if name in params:
-                temp[name] = parameter
-        params.update(temp)
-        classifier_trans.load_state_dict(params)
+    
+    classifier_trans = ReinDinov2_trans(variant, dino_state_dict, args.n_classes)
+    classifier_trans.eval()
+    temp = OrderedDict()
+    params = classifier_trans.state_dict()
+    classifier.load_state_dict(torch.load(os.path.join(model_dir, 'warmup_model.pth')))
+    for name, parameter in classifier.named_parameters():
+        if name in params:
+            temp[name] = parameter
+    params.update(temp)
+    classifier_trans.load_state_dict(params)
 
     classifier_trans.cuda()
     loss_function = nn.NLLLoss()
@@ -290,24 +373,27 @@ def main(args):
     for rd in range(args.round2):
         lr = lr * 0.99
         local_weights_list = []
-        for client_id in range(args.num_clients):
+        for client_id in range(args.n_clients):
             client = distilled_loader_clients_list[client_id]
+            if client == [] or len(client) == 0:
+                print(f"[Skip] No distilled data for client {client_id}.")
+                continue
             model_local_trans = copy.deepcopy(classifier_trans)
             model_local_trans.cuda()
             print('Training Transition Estimation Model Round [%d] on Client [%d]' % (rd + 1, client_id + 1))
             for epoch in range(args.local_ep):
                 loss_trans = 0.
                 model_local_trans.train()
-                optimizer_trans = torch.optim.AdamW(model_local_trans.parameters(), lr=args.lr)
+                optimizer_trans = torch.optim.AdamW(model_local_trans.parameters(), lr=lr)
                 for data, noisy_labels, pseudo_labels, index in client:
                     data = data.cuda()
                     pseudo_labels, noisy_labels = pseudo_labels.cuda(), noisy_labels.cuda()
                     batch_matrix = model_local_trans(data)
-                    noisy_class_post = torch.zeros((batch_matrix.shape[0], args.num_classes))
+                    noisy_class_post = torch.zeros((batch_matrix.shape[0], args.n_classes))
                     for j in range(batch_matrix.shape[0]):
-                        pseudo_label_one_hot = torch.nn.functional.one_hot(pseudo_labels[j], args.num_classes).float()
+                        pseudo_label_one_hot = torch.nn.functional.one_hot(pseudo_labels[j], args.n_classes).float()
                         pseudo_label_one_hot = pseudo_label_one_hot.unsqueeze(0)
-                        noisy_class_post_temp = pseudo_label_one_hot.float().mm(batch_matrix[j])
+                        noisy_class_post_temp = pseudo_label_one_hot.float().mm(batch_matrix[j].view(args.n_classes, args.n_classes))
                         noisy_class_post[j, :] = noisy_class_post_temp
                 noisy_class_post = torch.log(noisy_class_post + 1e-12)
                 loss = loss_function(noisy_class_post.cuda(), noisy_labels)
@@ -317,27 +403,27 @@ def main(args):
                 loss_trans += loss.item()
                 print('Training Epoch [%d], Loss: %.4f' % (epoch + 1, loss.item()))
             local_weights_list.append(copy.deepcopy(model_local_trans.state_dict()))
-        classifier_trans_weights = average_weights_weighted(local_weights_list, distilled_dataset_clients_list)
-        classifier_trans.load_state_dict(classifier_trans_weights)
-    torch.save(classifier_trans.state_dict(), model_dir + '/' + 'trans_model.pth')
+        if local_weights_list:
+            classifier_trans_weights = average_weights_weighted(local_weights_list, distilled_dataset_clients_list)
+            classifier_trans.load_state_dict(classifier_trans_weights)
+    torch.save(classifier_trans.state_dict(), os.path.join(model_dir, 'trans_model.pth'))
     print('----------Finishing Training Trans Matrix Estimation Model----------')
 
     # Finetuning
     print('----------Starting Finetuning Classifier Model----------')
-    val_acc_list = []
     test_acc_list = []
     best_acc = 0.
     best_round = 0
-    classifier.load_state_dict(torch.load(model_dir + '/' + 'warmup_model.pth'))
-    classifier_trans.load_state_dict(torch.load(model_dir + '/' + 'trans_model.pth'))
+    classifier.load_state_dict(torch.load(os.path.join(model_dir, 'warmup_model.pth')))
+    classifier_trans.load_state_dict(torch.load(os.path.join(model_dir, 'trans_model.pth')))
     classifier.cuda()
     classifier_trans.cuda()
     print('Loading Test Accuracy on the %s test data: Model1 %.4f %%' % (
-        len(test_dataset), evaluate(test_loader, classifier)))
+        len(dataset_test), evaluate(test_loader, classifier)))
 
     for rd in range(args.round3):
         local_weights_list, local_acc_list = [], []
-        selected_numb = random.sample(range(args.num_clients), args.num_clients)
+        selected_numb = random.sample(range(args.n_clients), args.n_clients)
         selected_clients = [clients_train_loader_list[i] for i in selected_numb]
         for client_id, client_train_loader in zip(selected_numb, selected_clients):
             model_local = copy.deepcopy(classifier)
@@ -347,7 +433,7 @@ def main(args):
                 model_local.train()
                 classifier_trans.eval()
                 optimizer_f = torch.optim.Adam(model_local.parameters(), lr=args.lr_f, weight_decay=args.weight_decay)
-                train_acc = train_forward(model_local, client_train_loader, optimizer_f, classifier_trans)
+                train_forward(model_local, client_train_loader, optimizer_f, classifier_trans)
                 test_acc = evaluate(test_loader, model_local)
                 print('Round [%d] Epoch [%d] Client [%d] Test: %.4f %%' % (rd + 1, epoch + 1, client_id + 1, test_acc))
             local_weights_list.append(copy.deepcopy(model_local.state_dict()))
@@ -356,11 +442,11 @@ def main(args):
         test_acc = evaluate(test_loader, classifier)
         test_acc_list.append(test_acc)
         print('Round [%d/%d] Test Accuracy on the %s test data: Model1 %.4f %%' % (
-            rd + 1, args.round3, len(test_dataset), test_acc))
+            rd + 1, args.round3, len(dataset_test), test_acc))
         if test_acc > best_acc:
             best_acc = test_acc
             best_round = rd + 1
-            torch.save(classifier.state_dict(), model_dir + '/' + 'final_model.pth')
+            torch.save(classifier.state_dict(), os.path.join(model_dir, 'final_model.pth'))
 
     print('Best Round [%d]' % best_round)
     best_id = np.argmax(np.array(test_acc_list))
@@ -371,22 +457,28 @@ def main(args):
 
 
 if __name__ == '__main__':
+    args = args_parser()
+    args.num_users = args.n_clients
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     acc_list = []
-    print(args.num_exp)
     for index_exp in range(args.num_exp):
-        print(index_exp)
+        print(f"--- Running Experiment {index_exp+1}/{args.num_exp} ---")
         args.seed = index_exp + 1
-        print(args.print_txt)
+        
         if args.print_txt:
-            f = open(save_dir + '_' + str(args.dataset) + '_' +
-                     str(args.noise_rate) + '_' + str(args.tau) + '.txt', 'a')
-            print(save_dir + '_' + str(args.dataset) + '_' +
-                     str(args.noise_rate) + '_' + str(args.tau) + '.txt')
-            sys.stdout = f
-        print('print finished')
-        print('start main')
+            log_file_path = os.path.join(args.result_dir, args.dataset, f'log_{args.noise_rate}_{args.tau}.txt')
+            os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+            sys.stdout = open(log_file_path, 'a')
+
+        print(f"Arguments: {args}")
         acc = main(args)
         acc_list.append(acc)
-    print(acc_list)
-    print(np.array(acc_list).mean())
-    print(np.array(acc_list).std(ddof=1))
+        
+        if args.print_txt:
+            sys.stdout.close()
+            sys.stdout = sys.__stdout__
+
+    print(f"All Accuracies: {acc_list}")
+    if len(acc_list) > 0:
+        print(f"Average Accuracy: {np.array(acc_list).mean()}")
+        print(f"Standard Deviation: {np.array(acc_list).std(ddof=1)}")

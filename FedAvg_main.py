@@ -25,6 +25,7 @@ import update
 import model
 import model_trans
 import model_dino
+import model_lora
 import dino_variant
 from update import train, average_weights, average_weights_weighted, evaluate, train_forward, average_reins
 from ensemble import compute_var, compute_mean_sq

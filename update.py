@@ -172,7 +172,12 @@ def evaluate(val_loader, model1):
     all_preds = []
     all_targets = []
     with torch.no_grad():
-        for data, noisy_label, clean_label, _ in val_loader:
+        for batch in val_loader:
+            if len(batch) == 4:
+                data, noisy_label, clean_label, _ = batch
+            else:
+                data, clean_label = batch
+                noisy_label = clean_label # placeholder
             data = data.cuda()
             logits1 = model1(data)
             outputs1 = F.softmax(logits1, dim=1)
@@ -305,12 +310,6 @@ def average_reins(global_model, client_models):
     bias_sum = sum(client.linear_rein2.bias.data for client in client_models)
     global_model.linear_rein2.weight.data.copy_(weight_sum / len(client_models))
     global_model.linear_rein2.bias.data.copy_(bias_sum / len(client_models))
-    
-    # 2-2. Average linear_norein weights and biases
-    weight_sum = sum(client.linear_norein.weight.data for client in client_models)
-    bias_sum = sum(client.linear_norein.bias.data for client in client_models)
-    global_model.linear_norein.weight.data.copy_(weight_sum / len(client_models))
-    global_model.linear_norein.bias.data.copy_(bias_sum / len(client_models))
 
     # 3. Broadcast updated global reins → 각 client.reins에 전달
     for client in client_models:
@@ -318,8 +317,6 @@ def average_reins(global_model, client_models):
         client.reins2.load_state_dict(global_model.reins2.state_dict())
         client.linear_rein.load_state_dict(global_model.linear_rein.state_dict())
         client.linear_rein2.load_state_dict(global_model.linear_rein2.state_dict())
-        client.linear_norein.load_state_dict(global_model.linear_norein.state_dict())
-        # client.linear_rein.load_state_dict(global_model.linear_rein.state_dict())
         client.reins.train()
 
 def PAPA_average_reins(global_model, client_models, alpha_papa=0.9):
@@ -432,12 +429,12 @@ def average_reins_with_transport(global_model, client_models):
             client.reins.train()
 
 def average_reins1(global_model, client_models):
-    # 1. Average entire reins1 (not just learnable_tokens)
+    # 1. Average entire reins
     with torch.no_grad():
-        # 모든 client의 reins1 파라미터 가져오기
+        # 모든 client의 reins파라미터 가져오기
         reins_named_params = {}
-        for name, _ in client_models[0].reins1.named_parameters():
-            stacked = torch.stack([dict(client.reins1.named_parameters())[name].data for client in client_models])
+        for name, _ in client_models[0].reins.named_parameters():
+            stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_models])
             reins_named_params[name] = stacked.mean(dim=0)
 
         # global_model.reins에 복사
@@ -451,12 +448,11 @@ def average_reins1(global_model, client_models):
     global_model.linear_rein.weight.data.copy_(weight_sum / len(client_models))
     global_model.linear_rein.bias.data.copy_(bias_sum / len(client_models))
 
-    # 3. Broadcast updated global reins → 각 client.reins2에 전달
+    # 3. Broadcast updated global reins → 각 client.reins에 전달
     for client in client_models:
-        client.reins2.load_state_dict(global_model.reins.state_dict())
-        for p in client.reins2.parameters():
-            p.requires_grad = True
-        client.reins2.train()
+        client.reins.load_state_dict(global_model.reins.state_dict())
+        client.linear_rein.load_state_dict(global_model.linear_rein.state_dict())
+        client.reins.train()
 
 def average_reins2(global_model, client_models):
     # 1. Average entire reins1 (not just learnable_tokens)
@@ -511,6 +507,130 @@ def average_reins2_ema(global_model, client_models, alpha=0.95):
         weight_avg = sum(client.linear_norein.weight.data for client in client_models) / len(client_models)
         bias_avg = sum(client.linear_norein.bias.data for client in client_models) / len(client_models)
 
+@torch.inference_mode()
+def aggregate_reins_refdist(
+    global_model,
+    client_models,
+    ref="fedavg",           # 'fedavg' | 'prev'
+    prev_global=None,       # ref='prev'일 때 기준 모델
+    metric="l2",            # 'l2' | 'cos'
+    lambda_=1.0,            # 거리 가중 온도
+    norm="mad",             # 'mad' | 'max'
+    eps=1e-12,
+):
+    """
+    DINOv2 + Rein 어댑터용 거리 기반 가중 집계.
+    - 대상: model.reins, model.reins2, linear_rein, linear_rein2
+    - weights_i ∝ exp(-lambda * D_i),  D_i = dist(client_i, ref)
+    """
+
+    K = len(client_models)
+    if ref == "prev" and prev_global is None:
+        raise ValueError("prev_global is required when ref='prev'.")
+
+    # --- helpers ---
+    def _named_vec(model):
+        """rein 관련 파라미터를 단일 벡터로 평탄화(CPU float32)."""
+        parts = []
+        for mod in (model.reins, model.reins2):
+            for _, p in mod.named_parameters():
+                parts.append(p.detach().float().cpu().view(-1))
+        parts.append(model.linear_rein.weight.detach().float().cpu().view(-1))
+        parts.append(model.linear_rein.bias.detach().float().cpu().view(-1))
+        parts.append(model.linear_rein2.weight.detach().float().cpu().view(-1))
+        parts.append(model.linear_rein2.bias.detach().float().cpu().view(-1))
+        return torch.cat(parts)
+
+    def _dist(a, b):
+        if metric == "l2":
+            return torch.norm(a - b, p=2).item()
+        elif metric == "cos":
+            na = torch.norm(a, p=2) + eps
+            nb = torch.norm(b, p=2) + eps
+            cos = torch.dot(a, b) / (na * nb)
+            return float(1.0 - cos.clamp(-1, 1).item())
+        else:
+            raise ValueError("metric must be 'l2' or 'cos'.")
+
+    def _norm_scale(d):
+        d = np.asarray(d, dtype=np.float64)
+        if norm == "mad":
+            med = np.median(d)
+            mad = np.median(np.abs(d - med)) + eps
+            D = np.abs(d - med) / mad
+        elif norm == "max":
+            D = d / (d.max() + eps)
+        else:
+            raise ValueError("norm must be 'mad' or 'max'.")
+        return D
+
+    def _weighted_avg_named(module_name):
+        """모듈 이름('reins'|'reins2')의 파라미터를 가중 평균."""
+        ref_client = client_models[0]
+        ref_named = dict(getattr(ref_client, module_name).named_parameters())
+        for name in ref_named.keys():
+            stacked = torch.stack([
+                dict(getattr(cm, module_name).named_parameters())[name].data.detach().float().cpu()
+                for cm in client_models
+            ], dim=0)  # [K, ...]
+            wv = torch.from_numpy(weights).float().view(K, *([1] * (stacked.dim() - 1)))
+            avg = (stacked * wv).sum(dim=0)
+            # copy back to global (device/dtype 보존)
+            gp = dict(getattr(global_model, module_name).named_parameters())[name]
+            avg = avg.to(device=gp.device, dtype=gp.dtype)
+            gp.copy_(avg)
+
+    def _weighted_avg_linear(attr_name):
+        """선형 레이어(linear_rein, linear_rein2) 가중 평균."""
+        # weight
+        stacked_w = torch.stack([getattr(cm, attr_name).weight.data.detach().float().cpu()
+                                 for cm in client_models], dim=0)
+        wv = torch.from_numpy(weights).float().view(K, *([1] * (stacked_w.dim() - 1)))
+        avg_w = (stacked_w * wv).sum(dim=0)
+        # bias
+        stacked_b = torch.stack([getattr(cm, attr_name).bias.data.detach().float().cpu()
+                                 for cm in client_models], dim=0)
+        wv_b = torch.from_numpy(weights).float().view(K, *([1] * (stacked_b.dim() - 1)))
+        avg_b = (stacked_b * wv_b).sum(dim=0)
+        # copy back
+        gm_layer = getattr(global_model, attr_name)
+        gm_layer.weight.data.copy_(avg_w.to(device=gm_layer.weight.device, dtype=gm_layer.weight.dtype))
+        gm_layer.bias.data.copy_(avg_b.to(device=gm_layer.bias.device, dtype=gm_layer.bias.dtype))
+
+    # --- 1) reference vector ---
+    if ref == "prev":
+        ref_vec = _named_vec(prev_global)
+    else:  # 'fedavg' 임시 평균로 ref 구성
+        # 파라미터별 평균을 만들기 보다는 벡터 평균이 간단
+        vecs = [_named_vec(cm) for cm in client_models]
+        ref_vec = torch.stack(vecs, dim=0).mean(dim=0)
+
+    # --- 2) distances & weights ---
+    vecs = [_named_vec(cm) for cm in client_models]
+    dists = [ _dist(v, ref_vec) for v in vecs ]
+
+    # 모든 거리가 0이면 균등 가중(FedAvg와 동일)
+    if max(dists) == 0.0:
+        weights = np.ones(K, dtype=np.float64) / K
+    else:
+        D = _norm_scale(dists)
+        weights = np.exp(-lambda_ * D)
+        weights = weights / (weights.sum() + eps)
+
+    # --- 3) weighted aggregation into global_model ---
+    _weighted_avg_named("reins")
+    _weighted_avg_named("reins2")
+    _weighted_avg_linear("linear_rein")
+    _weighted_avg_linear("linear_rein2")
+
+    # --- 4) broadcast back to clients ---
+    for cm in client_models:
+        cm.reins.load_state_dict(global_model.reins.state_dict())
+        cm.reins2.load_state_dict(global_model.reins2.state_dict())
+        cm.linear_rein.load_state_dict(global_model.linear_rein.state_dict())
+        cm.linear_rein2.load_state_dict(global_model.linear_rein2.state_dict())
+        cm.reins.train()
+        cm.reins2.train()
 
 def client_update_with_refinement(client_model, global_model, optimizers, loader, config, mix_ratio, class_total, class_p_list=None, dynamic_boost=None):
     num_classes = config['num_classes']
@@ -620,14 +740,14 @@ def client_update_with_refinement(client_model, global_model, optimizers, loader
                 class_noise_correct_rein[noise_label] += 1
         
         if class_p_list is not None:
-            # logits_rein = logits_rein + 0.5 * class_p_list
-            # logits_rein2 = logits_rein2 + 0.5 * class_p_list
+            logits_rein = logits_rein + class_p_list
+            logits_rein2 = logits_rein2 + class_p_list
             
-            # logits_rein = logits_rein + 1. * class_p_list + 0.1 * dynamic_boost
-            # logits_rein2 = logits_rein2 + 1. * class_p_list + 0.1 * dynamic_boost
+            # logits_rein = logits_rein + 0.5 * class_p_list + 0.5 * dynamic_boost
+            # logits_rein2 = logits_rein2 + 0.5 * class_p_list + 0.5 * dynamic_boost
             
-            logits_rein = logits_rein + 0.5 * dynamic_boost
-            logits_rein2 = logits_rein2 + 0.5 * dynamic_boost
+            # logits_rein = logits_rein + 0.5 * dynamic_boost
+            # logits_rein2 = logits_rein2 + 0.5 * dynamic_boost
         
         loss_ce = F.cross_entropy(logits_rein, targets_refine, reduction='none')
         loss_ce2 = F.cross_entropy(logits_rein2, targets_refine, reduction='none')
@@ -669,20 +789,6 @@ def client_update_with_refinement(client_model, global_model, optimizers, loader
           f"Target Match (by pred==label): {np.mean(clean_ratios)*100:.2f}%, Train Acc: {train_acc1:.2f}%"
     )
     
-    print("[Step1] Per-Class Accuracy (Clean):")
-    per_class_stats_rein = [
-        f"Class {cls}: {class_correct_rein[cls]}/{class_total[cls]} ({100.0 * class_correct_rein[cls] / class_total[cls]:.2f}%)"
-        if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
-        for cls in range(num_classes)
-    ]
-    print(" | ".join(per_class_stats_rein))
-    per_class_stats = [
-        f"Class {cls}: {class_correct[cls]}/{class_total[cls]} ({100.0 * class_correct[cls] / class_total[cls]:.2f}%)"
-        if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
-        for cls in range(num_classes)
-    ]
-    print(" | ".join(per_class_stats))
-    
     print("[Step2] Per-Class Accuracy (Noise):")
     per_class_stats_rein = [
         f"Class {cls}: {class_noise_correct_rein[cls]}/{class_noise_total[cls]} ({100.0 * class_noise_correct_rein[cls] / class_noise_total[cls]:.2f}%)"
@@ -697,173 +803,139 @@ def client_update_with_refinement(client_model, global_model, optimizers, loader
     ]
     print(" | ".join(per_class_stats))
     
-
-    # === Clean detection summary ===
-    print(f"[Step1] Detected Clean: {detected_clean_total}, "
-          f"True Clean: {true_clean_total}, "
-          f"Correctly Detected: {correct_detected_clean_total}, "
-          f"False Positives: {false_detected_clean_total}, "
-          f"Missed Clean Samples: {missed_clean_total}"
-    )
-    
     return class_total, dynamic_boost
     
-def client_update_with_rce(client_model, global_model, optimizers, loader, config, mix_ratio, class_total, class_p_list=None, dynamic_boost=None, lambda_rce=0.5):
+
+def client_update_with_LA(client_model, global_model, optimizers, loader, config, mix_ratio, class_total, class_p_list=None, dynamic_boost=None):
     num_classes = config['num_classes']
     device = config['device']
 
     client_model.eval()
     client_model.train()
 
-    optimizer_rein, optimizer_rein2 = optimizers
+    optimizer_rein = optimizers
+    total_loss = 0
+    # 클래스 분포 기반 가중치 및 조정값
+    if isinstance(class_total, dict):
+        class_total_tensor = torch.tensor(
+            [class_total.get(i, 0) for i in range(num_classes)],
+            dtype=torch.float,
+            device=device
+        )
+    else:
+        class_total_tensor = torch.tensor(class_total).to(device).float()
+    class_weights = F.softmax(class_total_tensor, dim=0)
 
-    ce_vals, rce_vals, clean_ratios = [], [], []
+    ce_vals, clean_ratios = [], []
     correct1, total1 = 0, 0
-
-    class_correct = defaultdict(int)
     class_total = defaultdict(int)
     class_correct_rein = defaultdict(int)
-    class_noise_correct = defaultdict(int)
-    class_noise_correct_rein = defaultdict(int)
-    class_noise_total = defaultdict(int)
 
-    detected_clean_total = 0
-    true_clean_total = 0
-    correct_detected_clean_total = 0
-    false_detected_clean_total = 0
-    missed_clean_total = 0
-
-    for inputs, targets, clean_targets, _ in loader:
+    for inputs, targets in loader:
         inputs = inputs.to(device)
         targets = targets.to(device)
-        clean_targets = clean_targets.to(device)
 
+        # === Guide model ===
         with torch.no_grad():
             feats_global = global_model.forward_features(inputs)[:, 0, :]
             logits_global = global_model.linear_rein(feats_global)
             pred_global = logits_global.argmax(dim=1)
-
-        linear_accurate_global_rein = (pred_global == targets)
-
+            
+        # === Client model ===
+        # feats_rein = client_model.forward_features_LA(inputs)[:, 0, :]
+        # logits_rein = client_model.linear_rein(feats_rein)
+        # pred_rein = logits_rein.argmax(dim=1)
+        # feats_norein = client_model.forward_features_no_rein(inputs)[:, 0, :]
+        # logits_norein = client_model.linear_norein(feats_norein)
+        
         feats_rein = client_model.forward_features(inputs)[:, 0, :]
         logits_rein = client_model.linear_rein(feats_rein)
-
+        
         feats_rein2 = client_model.forward_features2(inputs)[:, 0, :]
         logits_rein2 = client_model.linear_rein2(feats_rein2)
-
+        
         if class_p_list is not None:
-            logits_rein = logits_rein + 0.5 * class_p_list
-            logits_rein2 = logits_rein2 + 0.5 * class_p_list
+            # logits_norein = logits_norein + class_p_list
+            logits_rein = logits_rein + class_p_list
+            logits_rein2 = logits_rein2 + class_p_list
+        
+        with torch.no_grad():
+            # guide_norein = logits_norein.argmax(dim=1)
+            guide_rein = logits_rein.argmax(dim=1)
+        pred_rein = logits_rein2.argmax(dim=1)
 
-        reverse_labels = torch.full_like(logits_rein, fill_value=1 / (num_classes - 1))
-        reverse_labels.scatter_(1, targets.view(-1, 1), 0)
-
-        loss_ce = F.cross_entropy(logits_rein, targets, reduction='none')
-        loss_ce2 = F.cross_entropy(logits_rein2, targets, reduction='none')
-
-        log_probs_rein = F.log_softmax(-logits_rein, dim=1)
-        log_probs_rein2 = F.log_softmax(-logits_rein2, dim=1)
-
-        loss_rce = -(reverse_labels * log_probs_rein).sum(dim=1)
-        loss_rce2 = -(reverse_labels * log_probs_rein2).sum(dim=1)
-
-        # total_loss_rein = loss_ce + lambda_rce * loss_rce
-        total_loss_rein = loss_rce
-        # total_loss_rein2 = loss_ce2 + lambda_rce * loss_rce2
-        total_loss_rein2 = loss_ce2
-
-        masked_loss_rein = total_loss_rein.mean()
-        masked_loss_rein2 = (linear_accurate_global_rein * total_loss_rein2).mean()
-
-        optimizer_rein.zero_grad()
-        optimizer_rein2.zero_grad()
-
-        total_loss = masked_loss_rein + masked_loss_rein2
-        total_loss.backward()
-
-        optimizer_rein.step()
-        optimizer_rein2.step()
-
-        preds = logits_rein2.argmax(dim=1)
-
-        correct1 += (preds == targets).sum().item()
-        total1 += targets.size(0)
-
-        ce_vals.append(loss_ce.mean().item())
-        rce_vals.append(loss_rce.mean().item())
-
-        is_actually_clean = (targets == clean_targets)
-        total_clean = is_actually_clean.sum().item()
-        correct_detected_clean = (linear_accurate_global_rein & is_actually_clean).sum().item()
-        false_detected_clean = (linear_accurate_global_rein & ~is_actually_clean).sum().item()
-        missed_clean = (~linear_accurate_global_rein & is_actually_clean).sum().item()
-
-        detected_clean_total += linear_accurate_global_rein.sum().item()
-        true_clean_total += total_clean
-        correct_detected_clean_total += correct_detected_clean
-        false_detected_clean_total += false_detected_clean
-        missed_clean_total += missed_clean
-
-        clean_ratios.append((preds == clean_targets).float().mean().item())
+        # === Soft label construction ===
+        with torch.no_grad():
+        #     one_hot = F.one_hot(targets, num_classes=num_classes).to(device)
+        #     model_pred = logits_global.argmax(dim=1)
+        #     model_one_hot = F.one_hot(model_pred, num_classes=num_classes).to(device)
+        #     targets_refine_multi = torch.clamp(one_hot + model_one_hot, max=1)
+            # linear_accurate_norein = (guide_norein == targets)
+            linear_accurate = (guide_rein == targets)
 
         for i in range(targets.size(0)):
-            label = clean_targets[i].item()
-            noise_label = targets[i].item()
-            pred_label_rein = logits_rein.argmax(dim=1)[i].item()
-            pred_label = preds[i].item()
+            label = targets[i].item()
+            pred_label_rein = pred_rein[i].item()
 
             class_total[label] += 1
-            class_noise_total[noise_label] += 1
 
-            if label == pred_label:
-                class_correct[label] += 1
             if label == pred_label_rein:
                 class_correct_rein[label] += 1
-            if noise_label == pred_label:
-                class_noise_correct[noise_label] += 1
-            if noise_label == pred_label_rein:
-                class_noise_correct_rein[noise_label] += 1
 
-    train_acc1 = 100. * correct1 / total1
-    print(f"\n[Step1-RCE] Avg CE: {np.mean(ce_vals):.4f}, Avg RCE: {np.mean(rce_vals):.4f}, Train Acc: {train_acc1:.2f}%"
-    )
+        # loss_bce = F.binary_cross_entropy_with_logits(logits_rein, targets_refine_multi.float())
+        # loss_norein = F.cross_entropy(logits_norein, targets, reduction='none')
+        loss_ce = F.cross_entropy(logits_rein/0.8, targets, reduction='none')
+        loss_ce2 = F.cross_entropy(logits_rein2/0.8, targets, reduction='none')
+        loss_soft = F.kl_div(torch.log_softmax(logits_rein2/0.8, dim=-1), torch.softmax(logits_global, dim=-1), reduction='none')
+        loss_soft = 10*loss_soft.mean(dim=-1)
+        
+        # print(loss_ce, loss_soft)
+        # loss_ce = loss_ce.mean()
+        loss_agree = (linear_accurate*loss_ce2).mean() + loss_ce.mean()
+        loss_disagree = ((~linear_accurate)*((1-mix_ratio)*loss_ce2 + mix_ratio*loss_soft)).mean()
+        
+        # loss_agree = (linear_accurate*loss_ce2).mean() + (linear_accurate_norein*loss_ce).mean() + loss_norein.mean()
+        # loss_disagree = ((~linear_accurate)*((1-mix_ratio)*loss_ce2 + mix_ratio*loss_soft)).mean()
+        
+        # loss = loss_agree + loss_disagree
+        loss = loss_agree
 
-    print("[Step1-RCE] Per-Class Accuracy (Clean):")
-    per_class_stats_rein = [
-        f"Class {cls}: {class_correct_rein[cls]}/{class_total[cls]} ({100.0 * class_correct_rein[cls] / class_total[cls]:.2f}%)"
-        if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
-        for cls in range(num_classes)
-    ]
-    print(" | ".join(per_class_stats_rein))
+        optimizer_rein.zero_grad()
+        loss.backward()
+        optimizer_rein.step()
 
-    per_class_stats = [
-        f"Class {cls}: {class_correct[cls]}/{class_total[cls]} ({100.0 * class_correct[cls] / class_total[cls]:.2f}%)"
-        if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
-        for cls in range(num_classes)
-    ]
-    print(" | " .join(per_class_stats))
+        ce_vals.append(loss.mean().item())
+        clean_ratios.append(linear_accurate.float().mean().item())
 
-    print("[Step2-RCE] Per-Class Accuracy (Noise):")
-    per_class_stats_rein_noise = [
-        f"Class {cls}: {class_noise_correct_rein[cls]}/{class_noise_total[cls]} ({100.0 * class_noise_correct_rein[cls] / class_noise_total[cls]:.2f}%)"
-        if class_noise_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
-        for cls in range(num_classes)
-    ]
-    print(" | ".join(per_class_stats_rein_noise))
+        # correct_mask = targets_refine_multi[torch.arange(len(pred_rein)), pred_rein] == 1
+        # correct1 += correct_mask.sum().item()
+        
+        correct1 += (pred_rein == targets).sum().item()
+        total1 += targets.size(0)
 
-    per_class_stats_noise = [
-        f"Class {cls}: {class_noise_correct[cls]}/{class_noise_total[cls]} ({100.0 * class_noise_correct[cls] / class_noise_total[cls]:.2f}%)"
-        if class_noise_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
-        for cls in range(num_classes)
-    ]
-    print(" | ".join(per_class_stats_noise))
+    # === Dynamic Boost 업데이트 ===
+    for cls in range(num_classes):
+        if class_total[cls] > 0:
+            acc = class_correct_rein[cls] / class_total[cls]
+        else:
+            acc = 0.0
+        dynamic_boost[cls] = acc
+    dynamic_boost = torch.log(dynamic_boost + 1e-6)
 
-    print(f"[Step1] Detected Clean: {detected_clean_total}, True Clean: {true_clean_total}, Correctly Detected: {correct_detected_clean_total}, False Positives: {false_detected_clean_total}, Missed Clean Samples: {missed_clean_total}"
-    )
+    # train_acc1 = 100. * correct1 / total1
+    # print(f"\n[Step1] Avg CE (REIN): {np.mean(ce_vals):.4f}, "
+    #       f"Target Match (pred==guide): {np.mean(clean_ratios) * 100:.2f}%, Train Acc: {train_acc1:.2f}%")
+
+    # print("[Step2] Per-Class Accuracy :")
+    # per_class_stats_rein = [
+    #     f"Class {cls}: {class_correct_rein[cls]}/{class_total[cls]} "
+    #     f"({100.0 * class_correct_rein[cls] / class_total[cls]:.2f}%)"
+    #     if class_total[cls] > 0 else f"Class {cls}: 0/0 (0.00%)"
+    #     for cls in range(num_classes)
+    # ]
+    # print(" | ".join(per_class_stats_rein))
 
     return class_total, dynamic_boost
-
-
     
     
     

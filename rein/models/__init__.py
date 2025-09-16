@@ -1,2 +1,3 @@
 from .backbones import ReinsDinoVisionTransformer, DualReinsDinoVisionTransformer, LoRAFusedDualReinsDinoVisionTransformer,SelectiveReinsDinoVisionTransformer
 from .backbones import ReinsResNet
+from .backbones import LoRADinoVisionTransformer

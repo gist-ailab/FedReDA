@@ -86,6 +86,14 @@ def average_weights(w):
     print('model aggregation "average" took {}s'.format(time.time() - cur_time))
     return w_avg
 
+def average_weights_weighted(w, data_counts):
+    w_avg = copy.deepcopy(w[0])
+    total_count = sum(data_counts)
+    for k in w_avg.keys():
+        w_avg[k] = w_avg[k] * (data_counts[0] / total_count)
+        for i in range(1, len(w)):
+            w_avg[k] += w[i][k] * (data_counts[i] / total_count)
+    return w_avg
 
 def median_opt(input):
     shape = input.shape
