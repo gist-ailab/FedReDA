@@ -104,9 +104,9 @@ class DatasetSplit(Dataset):
 class FedCUFIT(ReinsDinoVisionTransformer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.reins_LPM = copy.deepcopy(self.reins1)
-        self.reins_IAM = copy.deepcopy(self.reins1)
-        self.reins_LAM = copy.deepcopy(self.reins1)
+        self.reins_LPM = copy.deepcopy(self.reins)
+        self.reins_IAM = copy.deepcopy(self.reins)
+        self.reins_LAM = copy.deepcopy(self.reins)
         self.linear_LPM = nn.Linear(_small_variant['embed_dim'], args.num_classes)
         self.linear_IAM = nn.Linear(_small_variant['embed_dim'], args.num_classes)
         self.linear_LAM = nn.Linear(_small_variant['embed_dim'], args.num_classes)
@@ -118,7 +118,7 @@ class FedCUFIT(ReinsDinoVisionTransformer):
         x = self.prepare_tokens_with_masks(x, masks)
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
-        out = self.linear_LPM(x)
+        out = self.linear_LPM(x[:,0,:])
         if return_feats:
             return out, x
         return out
@@ -128,7 +128,7 @@ class FedCUFIT(ReinsDinoVisionTransformer):
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
             x = self.reins_LPM.forward(x, idx, batch_first=True, has_cls_token=True)
-        out = self.linear_LPM(x)
+        out = self.linear_LPM(x[:,0,:])
         if return_feats:
             return out, x
         return out
@@ -138,7 +138,7 @@ class FedCUFIT(ReinsDinoVisionTransformer):
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
             x = self.reins_IAM.forward(x, idx, batch_first=True, has_cls_token=True)
-        out = self.linear_IAM(x)
+        out = self.linear_IAM(x[:,0,:])
         if return_feats:
             return out, x
         return out
@@ -148,7 +148,7 @@ class FedCUFIT(ReinsDinoVisionTransformer):
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
             x = self.reins_LAM.forward(x, idx, batch_first=True, has_cls_token=True)
-        out = self.linear_LAM(x)
+        out = self.linear_LAM(x[:,0,:])
         if return_feats:
             return out, x
         return out
@@ -204,7 +204,8 @@ def main(args):
 
 
     global_model = FedCUFIT(**_small_variant)
-    global_model.load_state_dict(torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth'), strict=False)
+    global_model.load_state_dict(torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth', weights_only=False), strict=False)
+    global_model.to(device)
     client_model_list = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
     logging.info("Step 0 Finished: Initialization complete.")
     
@@ -232,6 +233,8 @@ def main(args):
                     logits = model.forward_LAM(inputs)
                     logits = logits + 0.5*class_list
                     
+                    # print(logits.shape)
+                    # print(targets.shape)
                     # 초기 Warm up 중 noise의 영향을 최소화 하기 위해 loss기반 filtering 진행
                     ce_losses = F.cross_entropy(logits, targets, reduction='none')
                     sorted_loss, indices = torch.sort(ce_losses)
@@ -343,33 +346,57 @@ def main(args):
         
         with torch.no_grad():
             reins_named_params = {}
-            for name, _ in client_model_list[0].reins_LAM.named_parameters():
+            for name, _ in client_model_list[0].reins_LPM.named_parameters():
                 stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_model_list])
                 reins_named_params[name] = stacked.mean(dim=0)
-            
             for name, param in global_model.reins_LPM.named_parameters():
                 if name in reins_named_params:
                     param.data.copy_(reins_named_params[name])
             
+            reins_named_params = {}
+            for name, _ in client_model_list[0].reins_IAM.named_parameters():
+                stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_model_list])
+                reins_named_params[name] = stacked.mean(dim=0)
             for name, param in global_model.reins_IAM.named_parameters():
                 if name in reins_named_params:
                     param.data.copy_(reins_named_params[name])
                     
+            reins_named_params = {}
+            for name, _ in client_model_list[0].reins_LAM.named_parameters():
+                stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_model_list])
+                reins_named_params[name] = stacked.mean(dim=0)
             for name, param in global_model.reins_LAM.named_parameters():
                 if name in reins_named_params:
                     param.data.copy_(reins_named_params[name])
                     
-            weight_sum = sum(client.linear_LAM.weight.data for client in client_model_list)
-            bias_sum = sum(client.linear_LAM.bias.data for client in client_model_list)
+            weight_sum = sum(client.linear_LPM.weight.data for client in client_model_list)
+            bias_sum = sum(client.linear_LPM.bias.data for client in client_model_list)
             
             global_model.linear_LPM.weight.data.copy_(weight_sum / len(client_model_list))
             global_model.linear_LPM.bias.data.copy_(bias_sum / len(client_model_list))
             
+            weight_sum = sum(client.linear_IAM.weight.data for client in client_model_list)
+            bias_sum = sum(client.linear_IAM.bias.data for client in client_model_list)
+            
             global_model.linear_IAM.weight.data.copy_(weight_sum / len(client_model_list))
             global_model.linear_IAM.bias.data.copy_(bias_sum / len(client_model_list))
+            
+            weight_sum = sum(client.linear_LAM.weight.data for client in client_model_list)
+            bias_sum = sum(client.linear_LAM.bias.data for client in client_model_list)
             
             global_model.linear_LAM.weight.data.copy_(weight_sum / len(client_model_list))
             global_model.linear_LAM.bias.data.copy_(bias_sum / len(client_model_list))
         
+        bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='LPM')
+        logging.info(f"Global Model after Step 3 LPM - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
+        
+        bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='IAM')
+        logging.info(f"Global Model after Step 3 IAM - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
+        
         bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='LAM')
-        logging.info(f"Global Model after Step 1 - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
+        logging.info(f"Global Model after Step 3 LAM - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
+        
+if __name__ == "__main__":
+    args = args_parser()
+    torch.cuda.set_device(args.gpu)
+    main(args)

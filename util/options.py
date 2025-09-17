@@ -24,7 +24,7 @@ def args_parser():
     group_general.add_argument('--seed', type=int, default=0)
     group_general.add_argument('--print_freq', type=int, default=100)
     group_general.add_argument('--num_workers', type=int, help='how many subprocesses to use for data loading', default=16)
-    group_general.add_argument('--gpu', type=int, help='ind of gpu', default=1)
+    group_general.add_argument('--gpu', type=int, help='ind of gpu', default=0)
     group_general.add_argument('--weight_decay', type=float, default=5e-4)
     group_general.add_argument('--momentum', type=int, help='momentum', default=0.9)
     group_general.add_argument('--batch_size', type=int, help='batch_size', default=16)
