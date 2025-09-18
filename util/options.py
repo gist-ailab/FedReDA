@@ -37,7 +37,7 @@ def args_parser():
     # ========================= FedLNL Arguments =========================
     group_fedlnl = parser.add_argument_group('FedLNL')
     group_fedlnl.add_argument('--lr_f', type=float, default=1e-3, help='[FedLNL] learning rate for fine-tuning')
-    group_fedlnl.add_argument('--round1', type=int, help='[FedLNL] number of rounds for warming up', default=10)
+    group_fedlnl.add_argument('--round1', type=int, help='[FedLNL] number of rounds for warming up', default=1)
     group_fedlnl.add_argument('--round2', type=int, help='[FedLNL] number of rounds for training transition matrix estimation', default=50)
     group_fedlnl.add_argument('--round3', type=int, help='[FedLNL] number of rounds for fine-tuning', default=50)
     group_fedlnl.add_argument('--local_ep', type=int, help='number of local epochs', default=5)

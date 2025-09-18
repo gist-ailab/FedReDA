@@ -113,7 +113,7 @@ class FedCUFIT(ReinsDinoVisionTransformer):
 
         for name, param in self.reins_LPM.named_parameters():
             param.requires_grad = False
-            
+                        
     def forward_LPM(self, x, masks=None, return_feats=False):
         x = self.prepare_tokens_with_masks(x, masks)
         for idx, blk in enumerate(self.blocks):
@@ -128,6 +128,17 @@ class FedCUFIT(ReinsDinoVisionTransformer):
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
             x = self.reins_LPM.forward(x, idx, batch_first=True, has_cls_token=True)
+        out = self.linear_LPM(x[:,0,:])
+        if return_feats:
+            return out, x
+        return out
+    
+    def forward_ILPM(self, x, indexes, masks=None, return_feats=False):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            if idx in indexes:
+                x = self.reins_LPM.forward(x, idx, batch_first=True, has_cls_token=True)
         out = self.linear_LPM(x[:,0,:])
         if return_feats:
             return out, x
@@ -309,30 +320,49 @@ def main(args):
                     inputs, targets = inputs.to(device), targets.to(device)
                     
                     logit_LPM = client_model.forward_ALPM(inputs) + 0.5*class_list
-                    pred_LPM = torch.argmax(logit_LPM)
-                    logit_IAM = client_model.forward_IAM(inputs) + 0.5*class_list
-                    pred_IAM = torch.argmax(logit_IAM)
-                    logit_LAM = client_model.forward_LAM(inputs) + 0.5*class_list
-                    pred_LAM = torch.argmax(logit_LAM)
-                    
-                    with torch.no_grad():
-                        # global_logit_LPM = global_model.forward_ALPM(inputs) + 0.5*class_list
-                        # global_pred_LPM = torch.argmax(logit_LPM)
-                        # global_logit_IAM = global_model.forward_IAM(inputs) + 0.5*class_list
-                        # global_pred_IAM = torch.argmax(logit_IAM)
-                        # LPM_Agree = (global_pred_LPM==targets)
-                        # IAM_Agree = (global_pred_IAM==targets)
-                        
-                        LPM_Agree = (pred_LPM==targets)
-                        IAM_Agree = (pred_IAM==targets)
+                    # pred_LPM = torch.argmax(logit_ALPM, dim=1)
                     
                     loss_LPM = F.cross_entropy(logit_LPM, targets, reduction='none')
-                    loss_IAM = F.cross_entropy(logit_IAM, targets, reduction='none')
-                    loss_LAM = F.cross_entropy(logit_LAM, targets, reduction='none')
+                    loss = loss_LPM.mean()
                     
-                    loss = loss_LPM + \
-                           LPM_Agree * loss_IAM + \
-                           IAM_Agree * loss_LAM
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+            
+            for _ in range(args.local_ep):
+                for inputs, targets, batch_indices in loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    
+                    logit_IAM = client_model.forward_IAM(inputs) + 0.5*class_list
+                    pred_IAM = torch.argmax(logit_IAM, dim=1)
+                    
+                    with torch.no_grad():
+                        logit_LPM = client_model.forward_ALPM(inputs) + 0.5*class_list
+                        pred_LPM = torch.argmax(logit_LPM, dim=1)                        
+                        LPM_Agree = (pred_LPM==targets)
+                    
+                    loss_IAM = F.cross_entropy(logit_IAM, targets, reduction='none')     
+                    loss = LPM_Agree * loss_IAM
+                    loss = loss.mean()
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
+            for _ in range(args.local_ep):
+                for inputs, targets, batch_indices in loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    
+                    logit_LAM = client_model.forward_LAM(inputs) + 0.5*class_list
+                    pred_LAM = torch.argmax(logit_LAM, dim=1)
+                    
+                    with torch.no_grad():
+                        logit_IAM = client_model.forward_IAM(inputs) + 0.5*class_list
+                        pred_IAM = torch.argmax(logit_IAM, dim=1)                        
+                        IAM_Agree = (pred_IAM==targets)
+                    
+                    loss_LAM = F.cross_entropy(logit_LAM, targets, reduction='none')
+                    loss = IAM_Agree * loss_LAM
                     loss = loss.mean()
                     
                     optimizer.zero_grad()
