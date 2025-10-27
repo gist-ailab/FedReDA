@@ -43,7 +43,7 @@ def setup_logging():
         logger.removeHandler(handler)
         
     # 파일 핸들러
-    file_handler = logging.FileHandler('FedDouble.txt', mode='a')
+    file_handler = logging.FileHandler('FedCUFIT.txt', mode='a')
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     logger.addHandler(file_handler)
     
@@ -62,7 +62,11 @@ def calculate_accuracy(model, dataloader, device, mode='LAM'):
             inputs = inputs.to(device)
             
             if mode == 'LPM':
+                logits = model.forward_LPM(inputs)
+            elif mode == 'ALPM':
                 logits = model.forward_ALPM(inputs)
+            elif mode == 'ILPM':
+                logits = model.forward_ILPM(inputs, indexes=[-1])
             elif mode == 'IAM':
                 logits = model.forward_IAM(inputs)
             elif mode == 'LAM':
@@ -98,8 +102,9 @@ class DatasetSplit(Dataset):
 
     def __getitem__(self, item):
         image, label = self.dataset[self.idxs[item]]
+        true_label = self.dataset.true_labels[self.idxs[item]]
         index = self.idxs[item]
-        return image, label, index
+        return image, label, true_label, index
 
 class FedCUFIT(ReinsDinoVisionTransformer):
     def __init__(self, **kwargs):
@@ -111,8 +116,8 @@ class FedCUFIT(ReinsDinoVisionTransformer):
         self.linear_IAM = nn.Linear(_small_variant['embed_dim'], args.num_classes)
         self.linear_LAM = nn.Linear(_small_variant['embed_dim'], args.num_classes)
 
-        for name, param in self.reins_LPM.named_parameters():
-            param.requires_grad = False
+        # for name, param in self.reins_LPM.named_parameters():
+        #     param.requires_grad = False
                         
     def forward_LPM(self, x, masks=None, return_feats=False):
         x = self.prepare_tokens_with_masks(x, masks)
@@ -178,9 +183,10 @@ def main(args):
     logging.info("="*50)
     logging.info("Step 0: Initializing models, datasets, and clients")
     logging.info("="*50)
-
-    args.num_users = args.num_clients
+    
+    args.n_classes = args.num_clients
     args.n_clients = args.num_clients
+    args.num_users = args.num_clients
     
     dataset_train, dataset_test, dict_users = get_dataset(args)
     y_train = np.array(dataset_train.targets)
@@ -218,6 +224,11 @@ def main(args):
     global_model.load_state_dict(torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth', weights_only=False), strict=False)
     global_model.to(device)
     client_model_list = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+    
+    # 데이터셋 크기는 유지하면서 클라이언트 수만 줄여서 빠른 학습을 하게 하기 위함 (num clients = 5)
+    client_model_list = client_model_list[:5]
+    args.num_clients = 5
+    
     logging.info("Step 0 Finished: Initialization complete.")
     
     
@@ -238,22 +249,23 @@ def main(args):
             class_list = clients_train_class_num_list[client_idx]
             
             for _ in range(args.local_ep):
-                for inputs, targets, batch_indices in loader:
+                for inputs, targets, true_label, batch_indices in loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     
-                    logits = model.forward_LAM(inputs)
-                    logits = logits + 0.5*class_list
+                    # logits = model.forward_LAM(inputs)
+                    logits = model.forward_ILPM(inputs, [-1]) + 0.5*class_list
                     
                     # print(logits.shape)
                     # print(targets.shape)
                     # 초기 Warm up 중 noise의 영향을 최소화 하기 위해 loss기반 filtering 진행
                     ce_losses = F.cross_entropy(logits, targets, reduction='none')
-                    sorted_loss, indices = torch.sort(ce_losses)
-                    keep_ratio = args.warmup_keep_ratio if hasattr(args, 'warmup_keep_ratio') else 0.8
-                    keep_num = int(len(indices) * keep_ratio)
-                    select_idx = indices[:keep_num]
+                    # sorted_loss, indices = torch.sort(ce_losses)
+                    # keep_ratio = args.warmup_keep_ratio if hasattr(args, 'warmup_keep_ratio') else 0.8
+                    # keep_num = int(len(indices) * keep_ratio)
+                    # select_idx = indices[:keep_num]
                     
-                    loss = ce_losses[select_idx].mean()
+                    # loss = ce_losses[select_idx].mean()
+                    loss = ce_losses.mean()
                     
                     optimizer.zero_grad()
                     loss.backward()
@@ -269,7 +281,7 @@ def main(args):
     
     with torch.no_grad():
         reins_named_params = {}
-        for name, _ in client_model_list[0].reins_LAM.named_parameters():
+        for name, _ in client_model_list[0].reins_LPM.named_parameters():
             stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_model_list])
             reins_named_params[name] = stacked.mean(dim=0)
         
@@ -277,16 +289,16 @@ def main(args):
             if name in reins_named_params:
                 param.data.copy_(reins_named_params[name])
         
-        for name, param in global_model.reins_IAM.named_parameters():
-            if name in reins_named_params:
-                param.data.copy_(reins_named_params[name])
+        # for name, param in global_model.reins_IAM.named_parameters():
+        #     if name in reins_named_params:
+        #         param.data.copy_(reins_named_params[name])
                 
-        for name, param in global_model.reins_LAM.named_parameters():
-            if name in reins_named_params:
-                param.data.copy_(reins_named_params[name])
+        # for name, param in global_model.reins_LAM.named_parameters():
+        #     if name in reins_named_params:
+        #         param.data.copy_(reins_named_params[name])
                 
-        weight_sum = sum(client.linear_LAM.weight.data for client in client_model_list)
-        bias_sum = sum(client.linear_LAM.bias.data for client in client_model_list)
+        weight_sum = sum(client.linear_LPM.weight.data for client in client_model_list)
+        bias_sum = sum(client.linear_LPM.bias.data for client in client_model_list)
         
         global_model.linear_LPM.weight.data.copy_(weight_sum / len(client_model_list))
         global_model.linear_LPM.bias.data.copy_(bias_sum / len(client_model_list))
@@ -296,8 +308,11 @@ def main(args):
         
         global_model.linear_LAM.weight.data.copy_(weight_sum / len(client_model_list))
         global_model.linear_LAM.bias.data.copy_(bias_sum / len(client_model_list))
+        
+        for i in range(len(client_model_list)):
+            client_model_list[i] = copy.deepcopy(global_model)
     
-    bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='LAM')
+    bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='ILPM')
     logging.info(f"Global Model after Step 2 - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
     
     # =============================================================================
@@ -310,17 +325,25 @@ def main(args):
         
         for client_idx in range(args.num_clients):
             client_model = client_model_list[client_idx]
+            # client_model = copy.deepcopy(global_model)
             client_model.train()
             optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, client_model.parameters()), lr=args.lr)
             loader = clients_train_loader_list[client_idx]
             class_list = clients_train_class_num_list[client_idx]
             
-            for _ in range(args.local_ep):
-                for inputs, targets, batch_indices in loader:
+            for lep in range(args.local_ep):
+                acc = 0
+                sum_total = 0
+                for inputs, targets, true_label, batch_indices in loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     
-                    logit_LPM = client_model.forward_ALPM(inputs) + 0.5*class_list
-                    # pred_LPM = torch.argmax(logit_ALPM, dim=1)
+                    logit_LPM = client_model.forward_ILPM(inputs, [-1]) + 0.5*class_list
+                    pred_LPM = torch.argmax(logit_LPM, dim=1)
+                    with torch.no_grad():
+                        acc += torch.sum(pred_LPM==targets).float().mean().item()
+                        sum_total += torch.sum(targets)
+                    # acc_LPM = (pred_LPM == targets).float().mean().item()
+                    # print(f"LPM step acc: {acc_LPM:.4f}")
                     
                     loss_LPM = F.cross_entropy(logit_LPM, targets, reduction='none')
                     loss = loss_LPM.mean()
@@ -328,18 +351,28 @@ def main(args):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                print(f'Client{client_idx} Local Epoch {lep} LPM Train Acc : {100*acc/sum_total}')
             
-            for _ in range(args.local_ep):
-                for inputs, targets, batch_indices in loader:
+            for lep in range(args.local_ep):
+                acc = 0
+                sum_accurate = 0
+                sum_total = 0
+                for inputs, targets, true_label, batch_indices in loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     
                     logit_IAM = client_model.forward_IAM(inputs) + 0.5*class_list
                     pred_IAM = torch.argmax(logit_IAM, dim=1)
+                    # acc_IAM = (pred_IAM == targets).float().mean().item()
+                    # print(f"IAM step acc: {acc_IAM:.4f}")
                     
                     with torch.no_grad():
-                        logit_LPM = client_model.forward_ALPM(inputs) + 0.5*class_list
+                        logit_LPM = client_model.forward_ILPM(inputs, [-1]) + 0.5*class_list
                         pred_LPM = torch.argmax(logit_LPM, dim=1)                        
                         LPM_Agree = (pred_LPM==targets)
+                        
+                        acc += torch.sum(pred_IAM==targets).float().mean().item()
+                        sum_accurate += torch.sum(LPM_Agree)
+                        sum_total += torch.sum(targets)
                     
                     loss_IAM = F.cross_entropy(logit_IAM, targets, reduction='none')     
                     loss = LPM_Agree * loss_IAM
@@ -348,18 +381,29 @@ def main(args):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                print(f'Client{client_idx} Local Epoch {lep} LPM agree ratio : {100*sum_accurate/sum_total}')
+                print(f'Client{client_idx} Local Epoch {lep} IAM Train Acc : {100*acc/sum_total}')
                     
-            for _ in range(args.local_ep):
-                for inputs, targets, batch_indices in loader:
+            for lep in range(args.local_ep):
+                acc = 0
+                sum_accurate = 0
+                sum_total = 0
+                for inputs, targets, true_label, batch_indices in loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     
                     logit_LAM = client_model.forward_LAM(inputs) + 0.5*class_list
                     pred_LAM = torch.argmax(logit_LAM, dim=1)
+                    # acc_LAM = (pred_LAM == targets).float().mean().item()
+                    # print(f"LAM step acc: {acc_LAM:.4f}")
                     
                     with torch.no_grad():
                         logit_IAM = client_model.forward_IAM(inputs) + 0.5*class_list
                         pred_IAM = torch.argmax(logit_IAM, dim=1)                        
                         IAM_Agree = (pred_IAM==targets)
+                        
+                        acc += torch.sum(pred_LAM==targets).float().mean().item()
+                        sum_accurate += torch.sum(IAM_Agree)
+                        sum_total += torch.sum(targets)
                     
                     loss_LAM = F.cross_entropy(logit_LAM, targets, reduction='none')
                     loss = IAM_Agree * loss_LAM
@@ -368,6 +412,8 @@ def main(args):
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                print(f'Client{client_idx} Local Epoch {lep} IAM agree ratio : {100*sum_accurate/sum_total}')
+                print(f'Client{client_idx} Local Epoch {lep} LAM Train Acc : {100*acc/sum_total}')
     
         # =============================================================================
         # Step 3: 학습된 클라이언트 모델의 rein 어댑터를 모아서 global 모델 업데이트
@@ -395,6 +441,12 @@ def main(args):
             for name, _ in client_model_list[0].reins_LAM.named_parameters():
                 stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_model_list])
                 reins_named_params[name] = stacked.mean(dim=0)
+            # for name, param in global_model.reins_LPM.named_parameters():
+            #     if name in reins_named_params:
+            #         param.data.copy_(reins_named_params[name])
+            # for name, param in global_model.reins_IAM.named_parameters():
+            #     if name in reins_named_params:
+            #         param.data.copy_(reins_named_params[name])
             for name, param in global_model.reins_LAM.named_parameters():
                 if name in reins_named_params:
                     param.data.copy_(reins_named_params[name])
@@ -414,11 +466,20 @@ def main(args):
             weight_sum = sum(client.linear_LAM.weight.data for client in client_model_list)
             bias_sum = sum(client.linear_LAM.bias.data for client in client_model_list)
             
+            # global_model.linear_LPM.weight.data.copy_(weight_sum / len(client_model_list))
+            # global_model.linear_LPM.bias.data.copy_(bias_sum / len(client_model_list))
+            
+            # global_model.linear_IAM.weight.data.copy_(weight_sum / len(client_model_list))
+            # global_model.linear_IAM.bias.data.copy_(bias_sum / len(client_model_list))
+            
             global_model.linear_LAM.weight.data.copy_(weight_sum / len(client_model_list))
             global_model.linear_LAM.bias.data.copy_(bias_sum / len(client_model_list))
+            
+            for i in range(len(client_model_list)):
+                client_model_list[i] = copy.deepcopy(global_model)
         
-        bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='LPM')
-        logging.info(f"Global Model after Step 3 LPM - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
+        bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='ILPM')
+        logging.info(f"Global Model after Step 3 ILPM - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
         
         bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='IAM')
         logging.info(f"Global Model after Step 3 IAM - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")

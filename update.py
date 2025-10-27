@@ -164,60 +164,155 @@ def train_prox_one_step(net, global_model, data, label, optimizer, criterion, mu
 
 
 # Evaluate the Model
-def evaluate(val_loader, model1):
-    # print('Evaluating %s...' % model_str)
-    model1.eval()  # Change model to 'eval' mode.
-    correct1 = 0
-    total1 = 0
+# def evaluate(val_loader, model1):
+#     # print('Evaluating %s...' % model_str)
+#     model1.eval()  # Change model to 'eval' mode.
+#     correct1 = 0
+#     total1 = 0
+#     all_preds = []
+#     all_targets = []
+#     with torch.no_grad():
+#         for batch in val_loader:
+#             if len(batch) == 4:
+#                 data, noisy_label, clean_label, _ = batch
+#             else:
+#                 data, clean_label = batch
+#                 noisy_label = clean_label # placeholder
+#             data = data.cuda()
+#             logits1 = model1(data)
+#             outputs1 = F.softmax(logits1, dim=1)
+#             _, pred1 = torch.max(outputs1.data, 1)
+#             total1 += noisy_label.size(0)
+            
+#             all_preds.extend(pred1.cpu().numpy())
+#             all_targets.extend(clean_label.cpu().numpy())
+            
+#         #     correct1 += (pred1.cpu() == clean_label.long()).sum()
+#         # acc1 = 100 * float(correct1) / float(total1)
+#         balanced_acc = balanced_accuracy_score(all_targets, all_preds)
+
+#     return balanced_acc*100
+
+def evaluate(val_loader, model, use_amp=True, eps=1e-6):
+    model.eval()
     all_preds = []
     all_targets = []
+
     with torch.no_grad():
         for batch in val_loader:
             if len(batch) == 4:
                 data, noisy_label, clean_label, _ = batch
             else:
                 data, clean_label = batch
-                noisy_label = clean_label # placeholder
-            data = data.cuda()
-            logits1 = model1(data)
-            outputs1 = F.softmax(logits1, dim=1)
-            _, pred1 = torch.max(outputs1.data, 1)
-            total1 += noisy_label.size(0)
-            
-            all_preds.extend(pred1.cpu().numpy())
-            all_targets.extend(clean_label.cpu().numpy())
-            
-        #     correct1 += (pred1.cpu() == clean_label.long()).sum()
-        # acc1 = 100 * float(correct1) / float(total1)
-        balanced_acc = balanced_accuracy_score(all_targets, all_preds)
+                noisy_label = clean_label  # placeholder
 
-    return balanced_acc*100
+            data = data.cuda(non_blocking=True)
 
+            with torch.amp.autocast('cuda',enabled=use_amp):
+                logits = model(data)
 
-def train_forward(model, train_loader, optimizer, model_trans):
+            probs = F.softmax(logits.float(), dim=1)
+            probs = probs.clamp_min(eps)
+            probs = probs / probs.sum(dim=1, keepdim=True)
+
+            pred = probs.argmax(dim=1)
+
+            all_preds.extend(pred.cpu().tolist())
+            all_targets.extend(clean_label.cpu().long().tolist())
+
+    bal_acc = balanced_accuracy_score(all_targets, all_preds)
+    return bal_acc * 100.0
+
+# def train_forward(model, train_loader, optimizer, model_trans):
+#     model.train()
+#     train_total = 0
+#     train_correct = 0
+#     for i, (data, labels, _, indexes) in enumerate(train_loader):
+
+#         data = data.cuda()
+#         labels = labels.cuda()
+#         optimizer.zero_grad()
+#         logits = model(data)
+#         original_post = F.softmax(logits, dim=1)
+#         T = model_trans(data)
+#         noisy_post = torch.bmm(original_post.unsqueeze(1), T.cuda()).squeeze(1)
+#         log_noisy_post = torch.log(noisy_post + 1e-12)
+#         loss = nn.NLLLoss()(log_noisy_post.cuda(), labels.cuda())
+
+#         prec1, = accuracy(noisy_post, labels, topk=(1,))
+#         train_total += 1
+#         train_correct += prec1
+#         loss.backward()
+#         optimizer.step()
+
+#     train_acc = float(train_correct) / float(train_total)
+#     return train_acc
+
+def train_forward(model, train_loader, optimizer, model_trans, eps=1e-6, clip_norm=1.0, use_amp=True):
     model.train()
+    model_trans.eval()  # Trans는 항상 eval
     train_total = 0
     train_correct = 0
-    for i, (data, labels, _, indexes) in enumerate(train_loader):
 
-        data = data.cuda()
-        labels = labels.cuda()
-        optimizer.zero_grad()
-        logits = model(data)
-        original_post = F.softmax(logits, dim=1)
-        T = model_trans(data)
-        noisy_post = torch.bmm(original_post.unsqueeze(1), T.cuda()).squeeze(1)
-        log_noisy_post = torch.log(noisy_post + 1e-12)
-        loss = nn.NLLLoss()(log_noisy_post.cuda(), labels.cuda())
+    for data, labels, _, indexes in train_loader:
+        data   = data.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True).long()
 
-        prec1, = accuracy(noisy_post, labels, topk=(1,))
-        train_total += 1
-        train_correct += prec1
+        optimizer.zero_grad(set_to_none=True)
+
+        # 모델 로짓은 AMP 허용
+        with torch.amp.autocast('cuda',enabled=use_amp):
+            logits = model(data)  # (B,C)
+
+        # 확률은 FP32에서 안정화
+        original_post = F.softmax(logits.float(), dim=1)
+        original_post = original_post.clamp_min(eps)
+        original_post = original_post / original_post.sum(dim=1, keepdim=True)
+
+        # Trans 출력 -> 확률행렬 강제 (no grad)
+        with torch.no_grad(), torch.amp.autocast('cuda',enabled=use_amp):
+            T_logits = model_trans(data)      # (B,C,C)
+
+        T = F.softmax(T_logits.float(), dim=-1)
+        T = T.clamp_min(eps)
+        T = T / T.sum(dim=-1, keepdim=True)
+
+        # 조합 확률 및 손실
+        noisy_post = torch.bmm(original_post.unsqueeze(1), T).squeeze(1).float()
+        log_noisy_post = (noisy_post.clamp_min(eps)).log()
+
+        # 라벨 범위 가드
+        assert labels.min().item() >= 0 and labels.max().item() < log_noisy_post.size(1)
+
+        loss = nn.NLLLoss()(log_noisy_post, labels)
+
+        # 비정상 감지 시 스킵
+        if not torch.isfinite(loss):
+            print("[NaN guard] skip batch",
+                  "noisy_post[min,max]=", float(noisy_post.min()), float(noisy_post.max()))
+            
+            print(loss)
+            print('-'*20)
+            print(noisy_post)
+            print('-'*20)
+            print(log_noisy_post)
+            print('-'*20)
+            print(original_post)
+            print('-'*20)
+            print(T)
+            exit()
+
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
         optimizer.step()
 
-    train_acc = float(train_correct) / float(train_total)
-    return train_acc
+        # top-1
+        with torch.no_grad():
+            pred = noisy_post.argmax(dim=1)
+            train_correct += (pred == labels).float().mean().item()
+            train_total   += 1
+
+    return (train_correct / max(1, train_total))
 
 def average_weights(w):
     """

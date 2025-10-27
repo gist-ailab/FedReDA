@@ -30,6 +30,9 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score
 from dataset.dataset import get_dataset
 from utils.utils import add_noise
 # --------------------------------------
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
 
 # --- 로거 설정 ---
 def setup_logging():
@@ -105,8 +108,9 @@ class DatasetSplit(Dataset):
 
     def __getitem__(self, item):
         image, label = self.dataset[self.idxs[item]]
+        true_label = self.dataset.true_labels[self.idxs[item]]
         index = self.idxs[item]
-        return image, label, index
+        return image, label, true_label, index
 
 # 모델 정의 수정
 class FedDoubleModel(ReinsDinoVisionTransformer):
@@ -183,12 +187,126 @@ def main(args):
         
         clients_train_loader_list.append(train_loader)
         clients_train_class_num_list.append(class_p_list)
+        
+    clients_train_loader_list = clients_train_loader_list[:5]
+    args.num_clients = 5
 
     # =============================================================================
     # Step 1: 클라이언트 모델을 Linear Probing Layer만으로 학습.
     # =============================================================================
+    # logging.info("="*50)
+    # logging.info("Step 1: Training Linear Probing Model")
+    # logging.info("="*50)
+    
+    # # Global model은 rein2만 활용
+    # # Local model은 local adapter가 rein1, global adapter가 rein2를 사용
+    # # global_model = FedDoubleModel(**_small_variant)
+    # global_model = ReinsDinoVisionTransformer(**_small_variant)
+    # global_model.load_state_dict(torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth', weights_only=False), strict=False)
+    # global_model.linear_rein = nn.Linear(_small_variant['embed_dim'], args.num_classes)
+    # global_model.to(device)
+    # client_model_list = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+    
+    # loss_records = []
+    # for epoch in range(5):
+    #     for client_idx in range(args.num_clients):
+    #         model = client_model_list[client_idx]
+    #         model.train()
+            
+    #         # rein 어댑터와 linear_rein만 학습하도록 설정
+    #         for name, param in model.named_parameters():
+    #             if 'linear_rein.' in name:
+    #                 param.requires_grad = True
+    #             else:
+    #                 param.requires_grad = False
+                    
+    #         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    #         loader = clients_train_loader_list[client_idx]
+    #         class_list = clients_train_class_num_list[client_idx]
+            
+    #         for _ in range(args.local_ep):
+    #             for inputs, targets, true_label, batch_indices in loader:
+    #                 inputs, targets = inputs.to(device), targets.to(device)
+                    
+    #                 feats = model.forward_features_no_rein(inputs)[:, 0, :]
+    #                 logits = model.linear_rein(feats)+ 0.5*class_list
+    #                 ce_losses = F.cross_entropy(logits, targets, reduction='none')
+                    
+    #                 for i in range(len(batch_indices)):
+    #                     is_noisy = (targets[i] != true_label[i]).item()
+    #                     loss_records.append({
+    #                         "epoch": epoch,
+    #                         "client": client_idx,
+    #                         "index": batch_indices[i].item(),
+    #                         "loss": ce_losses[i].item(),
+    #                         "is_noisy": is_noisy,
+    #                         "label": targets[i].item(),       # noisy label 기준
+    #                         "true_label": true_label[i].item() # clean 기준
+    #                     })
+    #                 loss = ce_losses.mean()
+    #                 optimizer.zero_grad()
+    #                 loss.backward()
+    #                 optimizer.step()
+                    
+    # with torch.no_grad():
+    #     reins_named_params = {}
+    #     for name, _ in client_model_list[0].reins.named_parameters():
+    #         stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_model_list])
+    #         reins_named_params[name] = stacked.mean(dim=0)
+            
+    #     for name, param in global_model.reins.named_parameters():
+    #         if name in reins_named_params:
+    #             param.data.copy_(reins_named_params[name])
+                
+    #     weight_sum = sum(client.linear_rein.weight.data for client in client_model_list)
+    #     bias_sum = sum(client.linear_rein.bias.data for client in client_model_list)
+        
+    #     global_model.linear_rein.weight.data.copy_(weight_sum / len(client_model_list))
+    #     global_model.linear_rein.bias.data.copy_(bias_sum / len(client_model_list))
+    
+    # bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='norein')
+    # logging.info(f"Global Model after Step 2 - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
+    
+    # import pandas as pd
+    # df = pd.DataFrame(loss_records)
+    # print(df.groupby("is_noisy")["loss"].describe())
+    # print(df.groupby(["true_label", "is_noisy"])["loss"].describe())
+    
+    # plt.figure(figsize=(14,6))
+    # sns.boxplot(data=df, x="true_label", y="loss", hue="is_noisy")
+    # plt.xlabel("Class (True Label 기준)")
+    # plt.ylabel("Loss")
+    # plt.title("Per-class Loss Distribution (Clean vs Noisy)")
+    # plt.legend(title="is_noisy", labels=["Clean","Noisy"])
+    # plt.savefig(f"EP5_LPM_per_class_loss_box.png")
+    # plt.close()
+
+    # # -----------------------------
+    # # 2. 클래스별 Clean vs Noisy KDE/히스토그램
+    # g = sns.FacetGrid(df, col="true_label", hue="is_noisy", col_wrap=4, sharex=False, sharey=False)
+    # g.map(sns.histplot, "loss", bins=30, stat="density", alpha=0.5)
+    # g.add_legend()
+    # plt.subplots_adjust(top=0.9)
+    # g.fig.suptitle("Per-class Loss Histogram (Clean vs Noisy)")
+    # g.savefig(f"EP5_LPM_per_class_loss_hist.png")
+    # plt.close()
+        
+    # # Epoch별 평균 loss 추이
+    # plt.figure(figsize=(14,6))
+    # sns.lineplot(data=df, x="epoch", y="loss", hue="is_noisy", style="true_label", estimator="mean", errorbar="sd")
+    # plt.xlabel("Epoch")
+    # plt.ylabel("Average Loss")
+    # plt.title("Epoch-wise Per-class Loss (Clean vs Noisy)")
+    # plt.savefig(f"EP5_LPM_per_class_loss_epoch.png")
+    # plt.close()
+    
+    # =============================================================================
+    # Step 2: 클라이언트 모델들을 특정 idxs만 rein 어댑터를 추가해 학습.
+    # =============================================================================
+    # for adapter_idx in range(_small_variant['depth']):
+    adapter_idx = [10]
     logging.info("="*50)
-    logging.info("Step 1: Training Linear Probing Model")
+    logging.info(f"Step 2_{adapter_idx}: Training with Adapter Model with idx {adapter_idx}")
     logging.info("="*50)
     
     # Global model은 rein2만 활용
@@ -200,14 +318,15 @@ def main(args):
     global_model.to(device)
     client_model_list = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
     
-    for epoch in range(10):
+    loss_records = []
+    for epoch in range(5):
         for client_idx in range(args.num_clients):
             model = client_model_list[client_idx]
             model.train()
             
             # rein 어댑터와 linear_rein만 학습하도록 설정
             for name, param in model.named_parameters():
-                if 'linear_rein.' in name:
+                if 'reins.' in name or 'linear_rein.' in name:
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
@@ -217,15 +336,28 @@ def main(args):
             class_list = clients_train_class_num_list[client_idx]
             
             for _ in range(args.local_ep):
-                for inputs, targets, batch_indices in loader:
+                for inputs, targets, true_label, batch_indices in loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     
                     # feats = model.forward_features(inputs)[:, 0, :]
-                    feats = model.forward_features_no_rein(inputs)[:, 0, :]
+                    feats = model.forward_features_widx(inputs, idxs=adapter_idx)[:, 0, :]
                     logits = model.linear_rein(feats)
                     
-                    logits = logits + 0.5*class_list
-                    loss = F.cross_entropy(logits, targets)
+                    # logits = logits + 0.5*class_list
+                    ce_losses = F.cross_entropy(logits, targets, reduction='none')
+                
+                    for i in range(len(batch_indices)):
+                        is_noisy = (targets[i] != true_label[i]).item()
+                        loss_records.append({
+                            "epoch": epoch,
+                            "client": client_idx,
+                            "index": batch_indices[i].item(),
+                            "loss": ce_losses[i].item(),
+                            "is_noisy": is_noisy,
+                            "label": targets[i].item(),       # noisy label 기준
+                            "true_label": true_label[i].item() # clean 기준
+                        })
+                    loss = ce_losses.mean()
                     
                     optimizer.zero_grad()
                     loss.backward()
@@ -247,77 +379,42 @@ def main(args):
         global_model.linear_rein.weight.data.copy_(weight_sum / len(client_model_list))
         global_model.linear_rein.bias.data.copy_(bias_sum / len(client_model_list))
     
-    bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='norein')
+    bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='index', index=adapter_idx)
     logging.info(f"Global Model after Step 2 - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
     
-    # =============================================================================
-    # Step 2: 클라이언트 모델들을 특정 idxs만 rein 어댑터를 추가해 학습.
-    # =============================================================================
-    for adapter_idx in range(_small_variant['depth']):
-        logging.info("="*50)
-        logging.info(f"Step 2_{adapter_idx}: Training with Adapter Model with idx {adapter_idx}")
-        logging.info("="*50)
+    import pandas as pd
+    df = pd.DataFrame(loss_records)
+    print(df.groupby("is_noisy")["loss"].describe())
+    print(df.groupby(["true_label", "is_noisy"])["loss"].describe())
+    plt.figure(figsize=(14,6))
+    sns.boxplot(data=df, x="true_label", y="loss", hue="is_noisy")
+    plt.xlabel("Class (True Label 기준)")
+    plt.ylabel("Loss")
+    plt.title("Per-class Loss Distribution (Clean vs Noisy)")
+    plt.legend(title="is_noisy", labels=["Clean","Noisy"])
+    plt.savefig(f"EP5_Index({adapter_idx})_per_class_loss_box.png")
+    plt.close()
+
+    # -----------------------------
+    # 2. 클래스별 Clean vs Noisy KDE/히스토그램
+    g = sns.FacetGrid(df, col="true_label", hue="is_noisy", col_wrap=4, sharex=False, sharey=False)
+    g.map(sns.histplot, "loss", bins=30, stat="density", alpha=0.5)
+    g.add_legend()
+    plt.subplots_adjust(top=0.9)
+    g.fig.suptitle("Per-class Loss Histogram (Clean vs Noisy)")
+    g.savefig(f"EP5_Index({adapter_idx})_per_class_loss_hist.png")
+    plt.close()
         
-        # Global model은 rein2만 활용
-        # Local model은 local adapter가 rein1, global adapter가 rein2를 사용
-        # global_model = FedDoubleModel(**_small_variant)
-        global_model = ReinsDinoVisionTransformer(**_small_variant)
-        global_model.load_state_dict(torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth', weights_only=False), strict=False)
-        global_model.linear_rein = nn.Linear(_small_variant['embed_dim'], args.num_classes)
-        global_model.to(device)
-        client_model_list = [copy.deepcopy(global_model) for _ in range(args.num_clients)]
+    # Epoch별 평균 loss 추이
+    plt.figure(figsize=(14,6))
+    sns.lineplot(data=df, x="epoch", y="loss", hue="is_noisy", style="true_label", estimator="mean", errorbar="sd")
+    plt.xlabel("Epoch")
+    plt.ylabel("Average Loss")
+    plt.title("Epoch-wise Per-class Loss (Clean vs Noisy)")
+    plt.savefig(f"EP5_Index({adapter_idx})_per_class_loss_epoch.png")
+    plt.close()
         
-        for epoch in range(10):
-            for client_idx in range(args.num_clients):
-                model = client_model_list[client_idx]
-                model.train()
-                
-                # rein 어댑터와 linear_rein만 학습하도록 설정
-                for name, param in model.named_parameters():
-                    if 'reins.' in name or 'linear_rein.' in name:
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-                        
-                optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
-                loader = clients_train_loader_list[client_idx]
-                class_list = clients_train_class_num_list[client_idx]
-                
-                for _ in range(args.local_ep):
-                    for inputs, targets, batch_indices in loader:
-                        inputs, targets = inputs.to(device), targets.to(device)
-                        
-                        # feats = model.forward_features(inputs)[:, 0, :]
-                        feats = model.forward_features_widx(inputs, idxs=[adapter_idx])[:, 0, :]
-                        logits = model.linear_rein(feats)
-                        
-                        logits = logits + 0.5*class_list
-                        loss = F.cross_entropy(logits, targets)
-                        
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                        
-        with torch.no_grad():
-            reins_named_params = {}
-            for name, _ in client_model_list[0].reins.named_parameters():
-                stacked = torch.stack([dict(client.reins.named_parameters())[name].data for client in client_model_list])
-                reins_named_params[name] = stacked.mean(dim=0)
-                
-            for name, param in global_model.reins.named_parameters():
-                if name in reins_named_params:
-                    param.data.copy_(reins_named_params[name])
-                    
-            weight_sum = sum(client.linear_rein.weight.data for client in client_model_list)
-            bias_sum = sum(client.linear_rein.bias.data for client in client_model_list)
-            
-            global_model.linear_rein.weight.data.copy_(weight_sum / len(client_model_list))
-            global_model.linear_rein.bias.data.copy_(bias_sum / len(client_model_list))
-        
-        bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='index', index=adapter_idx)
-        logging.info(f"Global Model after Step 2 - BAcc: {bacc*100:.2f}%, Acc: {acc*100:.2f}%")
-        
-if __name__ == "__main__":
+if __name__ == "__main__":   
     args = args_parser()
     torch.cuda.set_device(args.gpu)
     main(args)

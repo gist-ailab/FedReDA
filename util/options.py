@@ -17,13 +17,21 @@ def args_parser():
     group_general = parser.add_argument_group('General')
     group_general.add_argument('--num_exp', type=int, default=1, help='number of experiments')
     group_general.add_argument('--print_txt', type=bool, default=True, help='print txt')
-    group_general.add_argument('--num_classes', type=int, default=5, help='number of classes')
+    # group_general.add_argument('--num_classes', type=int, default=8, help='number of classes')
     group_general.add_argument('--lr', type=float, default=3e-4, help='learning rate for training')
     group_general.add_argument('--result_dir', type=str, help='dir to save result txt files', default='results')
-    group_general.add_argument('--dataset', type=str, help='ich, ham10000, aptos, cifar10, cifar100', default='ich')
+    group_general.add_argument('--dataset', type=str, help='ich, ' \
+                                                            'isic2019, ' \
+                                                            'BloodMNIST, ' \
+                                                            'PathMNIST, ' \
+                                                            'OrganAMNIST, ' \
+                                                            'OrganSMNIST, ' \
+                                                            'OrganCMNIST, ' \
+                                                            'DermaMNIST,' \
+                                                            'cifar100', default='ich')
     group_general.add_argument('--seed', type=int, default=0)
     group_general.add_argument('--print_freq', type=int, default=100)
-    group_general.add_argument('--num_workers', type=int, help='how many subprocesses to use for data loading', default=16)
+    group_general.add_argument('--num_workers', type=int, help='how many subprocesses to use for data loading', default=4)
     group_general.add_argument('--gpu', type=int, help='ind of gpu', default=0)
     group_general.add_argument('--weight_decay', type=float, default=5e-4)
     group_general.add_argument('--momentum', type=int, help='momentum', default=0.9)
@@ -37,9 +45,9 @@ def args_parser():
     # ========================= FedLNL Arguments =========================
     group_fedlnl = parser.add_argument_group('FedLNL')
     group_fedlnl.add_argument('--lr_f', type=float, default=1e-3, help='[FedLNL] learning rate for fine-tuning')
-    group_fedlnl.add_argument('--round1', type=int, help='[FedLNL] number of rounds for warming up', default=1)
+    group_fedlnl.add_argument('--round1', type=int, help='[FedLNL] number of rounds for warming up', default=10)
     group_fedlnl.add_argument('--round2', type=int, help='[FedLNL] number of rounds for training transition matrix estimation', default=50)
-    group_fedlnl.add_argument('--round3', type=int, help='[FedLNL] number of rounds for fine-tuning', default=50)
+    group_fedlnl.add_argument('--round3', type=int, help='[FedLNL] number of rounds for fine-tuning', default=40)
     group_fedlnl.add_argument('--local_ep', type=int, help='number of local epochs', default=5)
     group_fedlnl.add_argument('--tau', type=float, help='[FedLNL] threshold', default=0.5)
     group_fedlnl.add_argument('--mixhigh', type=float, help='[FedLNL] mixup alpha high', default=0.5)
@@ -52,8 +60,8 @@ def args_parser():
     group_fednoro.add_argument('--non_iid_prob_class', type=float, default=0.9, help='[FedNoRo] parameter for non-iid class distribution')
     group_fednoro.add_argument('--alpha_dirichlet', type=float, default=2.0, help='[FedNoRo] parameter for non-iid dirichlet distribution')
     group_fednoro.add_argument('--level_n_system', type=float, default=1.0, help='[FedNoRo] system-level noise rate')
-    group_fednoro.add_argument('--level_n_lowerb', type=float, default=0.3, help='[FedNoRo] lower bound of client-level noise')
-    group_fednoro.add_argument('--level_n_upperb', type=float, default=0.5, help='[FedNoRo] upper bound of client-level noise')
+    group_fednoro.add_argument('--level_n_lowerb', type=float, default=0.5, help='[FedNoRo] lower bound of client-level noise')
+    group_fednoro.add_argument('--level_n_upperb', type=float, default=0.7, help='[FedNoRo] upper bound of client-level noise')
     group_fednoro.add_argument('--n_parties', type=int, default=10, help='[FedNoRo] number of participating parties')
     group_fednoro.add_argument('--n_type', type=str, default='instance', help='[FedNoRo] type of noise, instance or symmetric')
     group_fednoro.add_argument('--rounds', type=int, default=100, help='[FedNoRo] total communication rounds')

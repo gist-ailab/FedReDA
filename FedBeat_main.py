@@ -1,5 +1,11 @@
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+import os, sys, uuid, copy, logging, tempfile, shutil, errno
+import sys, multiprocessing as mp
+mp.set_executable(sys.executable)
+mp.set_start_method("spawn", force=True)
+
 import os
 import torch
 import torch.nn as nn
@@ -14,7 +20,7 @@ import copy
 import random
 from collections import OrderedDict, Counter
 from torch.utils.data import DataLoader, Dataset
-from util.util import add_noise, set_seed
+from utils.utils import add_noise, set_seed
 from dataset.dataset import get_dataset
 from model_dino import ReinDinov2, ReinDinov2_trans
 from dino_variant import _small_variant
@@ -24,6 +30,20 @@ from update import train, evaluate, train_forward
 from ensemble import compute_var, compute_mean_sq
 import dataset.dataset as dataset
 from PIL import Image
+
+def worker_init_fn(_):
+    tmpdir = f"/home/work/DATA1/tmp/worker_{uuid.uuid4().hex}"
+    os.makedirs(tmpdir, exist_ok=True)
+    os.environ["TMPDIR"] = tmpdir
+    tempfile.tempdir = tmpdir
+
+_old_rmtree = shutil.rmtree
+def safe_rmtree(path,*a,**kw):
+    try: return _old_rmtree(path,*a,**kw)
+    except OSError as e:
+        if e.errno == errno.EBUSY: return
+        raise
+shutil.rmtree = safe_rmtree
 
 def average_weights(w):
     """
@@ -60,7 +80,7 @@ def args_parser():
     parser.add_argument('--deterministic', type=int,  default=1,
                         help='whether use deterministic training')
     parser.add_argument('--seed', type=int,  default=0, help='random seed')
-    parser.add_argument('--gpu', type=str,  default='0', help='GPU to use')
+    parser.add_argument('--gpu', type=str,  default='1', help='GPU to use')
     parser.add_argument('--num_workers', type=int, default=4, help="num_workers")
     parser.add_argument('--result_dir', type=str, default='./results/', help="results dir")
     parser.add_argument('--noise_rate', type=float, default=1.0, help="noise rate")
@@ -90,9 +110,9 @@ def args_parser():
     parser.add_argument('--alpha_dirichlet', type=float,
                         default=2.0, help='parameter for non-iid')
     parser.add_argument('--local_ep', type=int, default=5, help='local epoch')
-    parser.add_argument('--round1', type=int,  default=1, help='rounds')
+    parser.add_argument('--round1', type=int,  default=10, help='rounds')
     parser.add_argument('--round2', type=int,  default=10, help='rounds')
-    parser.add_argument('--round3', type=int,  default=50, help='rounds')
+    parser.add_argument('--round3', type=int,  default=40, help='rounds')
 
 
 
@@ -104,15 +124,15 @@ def args_parser():
 
     # noise
     parser.add_argument('--level_n_system', type=float, default=1.0, help="fraction of noisy clients")
-    parser.add_argument('--level_n_lowerb', type=float, default=0.3, help="lower bound of noise level")
-    parser.add_argument('--level_n_upperb', type=float, default=0.5, help="upper bound of noise level")
+    parser.add_argument('--level_n_lowerb', type=float, default=0.5, help="lower bound of noise level")
+    parser.add_argument('--level_n_upperb', type=float, default=0.7, help="upper bound of noise level")
     parser.add_argument('--n_type', type=str, default="instance", help="type of noise")
 
     # FedBeat specific arguments
     parser.add_argument('--num_exp', type=int, default=1, help='number of experiments')
     parser.add_argument('--print_txt', type=bool, default=True, help='print txt')
-    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate for fine-tuning')
-    parser.add_argument('--lr_f', type=float, default=1e-3, help='learning rate for fine-tuning')
+    parser.add_argument('--lr', type=float, default=3e-4, help='learning rate for fine-tuning')
+    parser.add_argument('--lr_f', type=float, default=3e-4, help='learning rate for fine-tuning')
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--tau', type=float, help='threshold', default=0.4)
     parser.add_argument('--local_ep2', type=int, help='number of local epochs for finetuning', default=5)
@@ -466,7 +486,7 @@ if __name__ == '__main__':
         args.seed = index_exp + 1
         
         if args.print_txt:
-            log_file_path = os.path.join(args.result_dir, args.dataset, f'log_{args.noise_rate}_{args.tau}.txt')
+            log_file_path = os.path.join(args.result_dir, args.dataset, f'log_{args.noise_rate}_{args.tau}_{(args.level_n_upperb+args.level_n_lowerb)/2}.txt')
             os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
             sys.stdout = open(log_file_path, 'a')
 
