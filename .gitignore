@@ -181,3 +181,4 @@ cython_debug/
 *.npy
 *.main1
 *.tmp
+*.ckpt
