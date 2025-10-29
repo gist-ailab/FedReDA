@@ -133,7 +133,7 @@ class FedDoubleModel(ReinsDinoVisionTransformer):
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
             x = self.reins2.forward(x, idx, batch_first=True, has_cls_token=True)
-            x = self.reins.forward(x, idx, batch_first=True, has_cls_token=True)
+            x = x+self.reins.forward(x, idx, batch_first=True, has_cls_token=True)
         return x
     def forward_fusion3(self, x):
         return self.forward_features(x) + self.forward_features2(x)
@@ -522,7 +522,6 @@ def main(args):
 
                         # mask (확률 캐시 → 텐서)
                         with torch.no_grad():
-                            # 파이썬 루프 최소화: 리스트 내포 후 텐서화
                             probs = torch.tensor(
                                 [client_clean_prob[client_idx][int(j)] for j in batch_indices],
                                 device=inputs.device, dtype=torch.float32

@@ -329,18 +329,18 @@ def main(args):
                 val_acc = evaluate(test_loader, classifier)
             log.info(f'Warm up Round [{rd+1}] Val Acc: {val_acc:.4f} %')
 
-            # if val_acc > best_acc:
-            #     best_acc = val_acc; best_round = rd + 1
-            #     best_model_weights_list = copy.deepcopy(local_weights_list)
-                # torch.save(classifier.state_dict(), os.path.join(model_dir, 'warmup_model.pth'))
+            if val_acc > best_acc:
+                best_acc = val_acc; best_round = rd + 1
+                best_model_weights_list = copy.deepcopy(local_weights_list)
+                torch.save(classifier.state_dict(), os.path.join(model_dir, 'warmup_model.pth'))
 
             # save warmup round ckpt
-            # save_ckpt(os.path.join(ckpt_dir, f"warmup_rd{rd+1}.pth"), {
-            #     "classifier": classifier.state_dict(),
-            #     "best_acc": best_acc,
-            #     "best_round": best_round,
-            #     "best_model_weights_list": best_model_weights_list
-            # })
+            save_ckpt(os.path.join(ckpt_dir, f"warmup_rd{rd+1}.pth"), {
+                "classifier": classifier.state_dict(),
+                "best_acc": best_acc,
+                "best_round": best_round,
+                "best_model_weights_list": best_model_weights_list
+            })
 
         # mark done
         save_ckpt(warm_done_path, {
