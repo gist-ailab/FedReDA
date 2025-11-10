@@ -1,3 +1,5 @@
+# FedDouble_split_adapter_dual_infer.py
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -77,7 +79,7 @@ def setup_logging():
     logger.setLevel(logging.INFO)
     for h in logger.handlers[:]:
         logger.removeHandler(h)
-    fh = logging.FileHandler('FedDouble_optimized.txt', mode='a')
+    fh = logging.FileHandler('FedDouble_split_adapter_dual_infer.txt', mode='a')
     fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     logger.addHandler(fh)
     ch = logging.StreamHandler()
@@ -109,25 +111,24 @@ def build_loader(ds, args, shuffle=True):
 class FedDoubleModel(ReinsDinoVisionTransformer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+    # teacher (clean)
     def forward_features2(self, x, masks=None):
         x = self.prepare_tokens_with_masks(x, masks)
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
             x = self.reins2.forward(x, idx, batch_first=True, has_cls_token=True)
         return x
+
+    # (원본 학생 경로; 필요시 사용)
     def forward_features3(self, x, masks=None):
         x = self.prepare_tokens_with_masks(x, masks)
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
             x = self.reins3.forward(x, idx, batch_first=True, has_cls_token=True)
         return x
-    def forward_fusion1(self, x, masks=None):
-        x = self.prepare_tokens_with_masks(x, masks)
-        for idx, blk in enumerate(self.blocks):
-            x = blk(x)
-            x1 = self.reins2.forward(x, idx, batch_first=True, has_cls_token=True)
-            x2 = self.reins.forward(x, idx, batch_first=True, has_cls_token=True)
-        return x1+x2
+
+    # fusion teacher (원본 유지)
     def forward_fusion2(self, x, masks=None):
         x = self.prepare_tokens_with_masks(x, masks)
         for idx, blk in enumerate(self.blocks):
@@ -135,10 +136,30 @@ class FedDoubleModel(ReinsDinoVisionTransformer):
             x = self.reins2.forward(x, idx, batch_first=True, has_cls_token=True)
             x = x+self.reins.forward(x, idx, batch_first=True, has_cls_token=True)
         return x
-    def forward_fusion3(self, x):
-        return self.forward_features(x) + self.forward_features2(x)
 
-# ---------- Eval ----------
+    # split student branches
+    def forward_features3_clean(self, x, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            x = self.reins3_clean.forward(x, idx, batch_first=True, has_cls_token=True)
+        return x
+    def forward_features3_noisy(self, x, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            x = self.reins3_noisy.forward(x, idx, batch_first=True, has_cls_token=True)
+        return x
+
+    # global noisy (for inference)
+    def forward_features2_noisy(self, x, masks=None):
+        x = self.prepare_tokens_with_masks(x, masks)
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+            x = self.reins2_noisy.forward(x, idx, batch_first=True, has_cls_token=True)
+        return x
+
+# ---------- Eval helpers ----------
 @torch.no_grad()
 def calculate_accuracy(model, dataloader, device, mode='rein'):
     model.eval()
@@ -158,6 +179,12 @@ def calculate_accuracy(model, dataloader, device, mode='rein'):
             elif mode == 'fusion':
                 feats = model.forward_fusion2(inputs)[:, 0, :]
                 logits = model.linear_rein(feats)
+            elif mode == 'split_clean':
+                feats = model.forward_features3_clean(inputs)[:,0,:]
+                logits = model.linear_rein3_clean(feats)
+            elif mode == 'split_noisy':
+                feats = model.forward_features3_noisy(inputs)[:,0,:]
+                logits = model.linear_rein3_noisy(feats)
             else:
                 feats = model.forward_features(inputs)[:, 0, :]
                 logits = model.linear_rein(feats)
@@ -167,9 +194,62 @@ def calculate_accuracy(model, dataloader, device, mode='rein'):
     targets = torch.cat(targets).numpy()
     return balanced_accuracy_score(targets, preds), accuracy_score(targets, preds)
 
+@torch.no_grad()
+def evaluate_inference(model, dataloader, device, args):
+    """
+    Inference modes:
+      - clean:  z = z_clean
+      - merged: z = z_clean + merge_eps * z_noisy
+      - dual:   z = z_clean + lambda * z_noisy
+                (if dual_entropy_gate>0, use entropy gate to set lambda in {0,1})
+    """
+    model.eval()
+    mode = getattr(args, "inference_mode", "clean")
+    merge_eps = float(getattr(args, "merge_eps", 0.1))
+    dual_lambda = float(getattr(args, "dual_lambda", 0.2))
+    ent_gate = float(getattr(args, "dual_entropy_gate", -1.0))
+
+    preds, targets = [], []
+    with torch.inference_mode():
+        for inputs, t in dataloader:
+            x = inputs.to(device, non_blocking=True)
+            t_cpu = torch.as_tensor(t)
+            with torch.amp.autocast('cuda', enabled=USE_AMP):
+                # clean branch logits
+                f_c = model.forward_features2(x)[:,0,:]
+                z_c = model.linear_rein2(f_c)
+
+                if mode == "clean":
+                    z = z_c
+
+                else:
+                    # noisy branch logits (global)
+                    f_n = model.forward_features2_noisy(x)[:,0,:]
+                    z_n = model.linear_rein2_noisy(f_n)
+
+                    if mode == "merged":
+                        z = z_c + merge_eps * z_n
+
+                    elif mode == "dual":
+                        if ent_gate is not None and ent_gate > 0:
+                            # entropy of clean probs
+                            p_c = z_c.softmax(1).clamp_min(1e-8)
+                            ent = (-p_c * p_c.log()).sum(1)  # [B]
+                            lam = (ent > ent_gate).float().view(-1,1)  # {0,1}
+                            z = z_c + lam * z_n  # gate: if high-entropy → rely on noisy
+                        else:
+                            z = z_c + dual_lambda * z_n
+                    else:
+                        z = z_c  # fallback
+
+                y_hat = torch.argmax(z, dim=1).cpu()
+            preds.append(y_hat)
+            targets.append(t_cpu)
+    preds = torch.cat(preds).numpy(); targets = torch.cat(targets).numpy()
+    return balanced_accuracy_score(targets, preds), accuracy_score(targets, preds)
+
 # ---------- GMM Split (class-wise) ----------
 def gmm_split_classwise(sample_indices, sample_labels, sample_loss_mean):
-    # numpy-only preproc; fit per-class GMM on z-scored loss
     idx = np.asarray(sample_indices)
     y   = np.asarray(sample_labels)
     L   = np.asarray(sample_loss_mean, dtype=np.float64)
@@ -181,12 +261,10 @@ def gmm_split_classwise(sample_indices, sample_labels, sample_loss_mean):
         if idxs.size < GMM_MIN_SAMPLES_PER_CLASS or not np.isfinite(Lc).all():
             for i in idxs: clean[int(i)] = True
             continue
-        # z-score
         mu, std = Lc.mean(), Lc.std()
         Lz = (Lc - mu) / (std + 1e-8)
         gmm = GaussianMixture(n_components=2, random_state=GMM_RANDOM_SEED).fit(Lz.reshape(-1,1))
         lab = gmm.predict(Lz.reshape(-1,1))
-        # choose lower-mean cluster as clean
         means = [Lc[lab==k].mean() if np.any(lab==k) else np.inf for k in range(2)]
         clean_c = int(np.argmin(means))
         for i, z in zip(idxs, lab):
@@ -204,27 +282,16 @@ def average_adapter_to_global(
     target_head="linear_rein2",
     strict_shape=True,
 ):
-    """
-    클라이언트의 {client_prefix, client_head} 파라미터를 평균내어
-    글로벌 모델의 {target_prefix, target_head}에 덮어씀.
-    """
     g_sd = global_model.state_dict()
-
-    # 타겟(글로벌) 키 목록
     tgt_adapter_keys = [k for k in g_sd.keys() if k.startswith(target_prefix + ".")]
     tgt_head_w = f"{target_head}.weight"
     tgt_head_b = f"{target_head}.bias"
     all_tgt_keys = tgt_adapter_keys + [tgt_head_w, tgt_head_b]
 
-    # 합 초기화(글로벌 키 기준)
     sums = {k: torch.zeros_like(g_sd[k]) for k in all_tgt_keys}
     n = float(len(client_models))
-
-    # 누적합: 각 글로벌 키에 대응되는 클라이언트 키 = client_prefix로 치환
     for m in client_models:
         msd = m.state_dict()
-
-        # 어댑터
         for tgt_k in tgt_adapter_keys:
             cli_k = tgt_k.replace(target_prefix + ".", client_prefix + ".")
             if cli_k not in msd:
@@ -232,8 +299,6 @@ def average_adapter_to_global(
             if strict_shape and (msd[cli_k].shape != g_sd[tgt_k].shape):
                 raise ValueError(f"Shape mismatch: {cli_k} vs {tgt_k} -> {msd[cli_k].shape} vs {g_sd[tgt_k].shape}")
             sums[tgt_k].add_(msd[cli_k])
-
-        # 헤드
         for tgt_k, cli_k in [(tgt_head_w, f"{client_head}.weight"),
                              (tgt_head_b, f"{client_head}.bias")]:
             if cli_k not in msd:
@@ -241,18 +306,21 @@ def average_adapter_to_global(
             if strict_shape and (msd[cli_k].shape != g_sd[tgt_k].shape):
                 raise ValueError(f"Shape mismatch: {cli_k} vs {tgt_k} -> {msd[cli_k].shape} vs {g_sd[tgt_k].shape}")
             sums[tgt_k].add_(msd[cli_k])
-
-    # 평균 내서 글로벌에 기록
     for k in all_tgt_keys:
         g_sd[k].copy_(sums[k] / n)
-
     global_model.load_state_dict(g_sd, strict=True)
 
 # ---------- Main ----------
 def main(args):
     setup_logging()
     logging.info("="*50)
-    logging.info("Starting FedDouble (optimized) ...")
+    logging.info("Starting FedDouble (split-adapter + dual-branch inference) ...")
+
+    # inject new flags if missing
+    if not hasattr(args, "inference_mode"):      args.inference_mode = "clean"   # clean|merged|dual
+    if not hasattr(args, "merge_eps"):           args.merge_eps = 0.1
+    if not hasattr(args, "dual_lambda"):         args.dual_lambda = 0.2
+    if not hasattr(args, "dual_entropy_gate"):   args.dual_entropy_gate = -1.0
 
     device = torch.device(f"cuda:{args.gpu}")
     scaler = torch.amp.GradScaler('cuda',enabled=USE_AMP)
@@ -282,7 +350,6 @@ def main(args):
         client_indices = dict_users[i]
         client_dataset = DatasetSplit(dataset_train, client_indices)
         train_loader = build_loader(client_dataset, args, shuffle=True)
-        # class-prior on GPU (cached tensor); keep as 1xC
         class_num = torch.bincount(
             torch.as_tensor([dataset_train.targets[idx] for idx in client_indices], dtype=torch.long),
             minlength=args.num_classes
@@ -297,11 +364,26 @@ def main(args):
         torch.load('/home/work/Workspaces/yunjae_heo/FedLNL/checkpoints/dinov2_vits14_pretrain.pth'),
         strict=False
     )
-    global_model.linear_rein  = nn.Linear(_small_variant['embed_dim'], args.num_classes)
+    embed_dim = _small_variant['embed_dim']
+
+    # 원본 구조 유지 + teacher(head)
+    global_model.linear_rein  = nn.Linear(embed_dim, args.num_classes)
     global_model.reins2       = copy.deepcopy(global_model.reins)
-    global_model.linear_rein2 = nn.Linear(_small_variant['embed_dim'], args.num_classes)
-    global_model.reins3       = copy.deepcopy(global_model.reins)
-    global_model.linear_rein3 = nn.Linear(_small_variant['embed_dim'], args.num_classes)
+    global_model.linear_rein2 = nn.Linear(embed_dim, args.num_classes)
+
+    # ---------- split student adapters ----------
+    global_model.reins3_clean = copy.deepcopy(global_model.reins)
+    global_model.reins3_noisy = copy.deepcopy(global_model.reins)
+    global_model.linear_rein3_clean = nn.Linear(embed_dim, args.num_classes)
+    global_model.linear_rein3_noisy = nn.Linear(embed_dim, args.num_classes)
+
+    # ---------- global noisy branch for inference ----------
+    global_model.reins2_noisy = copy.deepcopy(global_model.reins2)
+    global_model.linear_rein2_noisy = nn.Linear(embed_dim, args.num_classes)
+    with torch.no_grad():
+        global_model.linear_rein2_noisy.weight.copy_(global_model.linear_rein2.weight)
+        global_model.linear_rein2_noisy.bias.copy_(global_model.linear_rein2.bias)
+
     global_model.to(device)
 
     if TORCH_COMPILE:
@@ -310,7 +392,7 @@ def main(args):
         except Exception:
             pass
 
-    # 클라이언트 모델 초기화 (1회만 deepcopy)
+    # 클라이언트 모델 초기화
     client_model_list = [copy.deepcopy(global_model).to(device) for _ in range(args.num_clients)]
 
     # clean 확률 캐시
@@ -321,7 +403,6 @@ def main(args):
     for epoch in tqdm(range(args.round1), desc="Step1: Pretrain-Epoch", position=0):
         for client_idx in tqdm(range(args.num_clients), desc="Clients", leave=False, position=1):
             model = client_model_list[client_idx]
-            # requires_grad 설정 (파라미터 수집 캐시)
             for n, p in model.named_parameters():
                 p.requires_grad = ('reins.' in n) or ('linear_rein.' in n)
             opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
@@ -341,11 +422,9 @@ def main(args):
                     scaler.step(opt); scaler.update()
         logging.info(f"epoch {epoch} pretrain done.")
 
-    # ====== Step 2: Average to global rein2 ======
+    # ====== Step 2: Average 'rein' -> global.reins2 ======
     logging.info("Step 2: Averaging 'rein' -> global rein2")
-    # 평균화는 state_dict 필터링으로 수행
     with torch.no_grad():
-        # 평균
         for name, _ in global_model.reins2.named_parameters():
             stacked = torch.stack([dict(cm.reins.named_parameters())[name].data for cm in client_model_list])
             dict(global_model.reins2.named_parameters())[name].data.copy_(stacked.mean(dim=0))
@@ -354,44 +433,57 @@ def main(args):
         global_model.linear_rein2.weight.data.copy_(w_sum/len(client_model_list))
         global_model.linear_rein2.bias.data.copy_(b_sum/len(client_model_list))
 
-    bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='rein2')
-    logging.info(f"After Step2 - BAcc: {bacc*100:.2f}% | Acc: {acc*100:.2f}%")
+        # 초기 noisy-global은 clean-global을 복제
+        for name, p in global_model.reins2_noisy.named_parameters():
+            p.data.copy_(dict(global_model.reins2.named_parameters())[name].data)
+        global_model.linear_rein2_noisy.weight.data.copy_(global_model.linear_rein2.weight.data)
+        global_model.linear_rein2_noisy.bias.data.copy_(global_model.linear_rein2.bias.data)
+
+    bacc, acc = evaluate_inference(global_model, test_loader, device, args)
+    logging.info(f"After Step2  [infer={args.inference_mode}]  BAcc: {bacc*100:.2f}% | Acc: {acc*100:.2f}%")
 
     # ====== Main Training Loop ======
     for epoch in tqdm(range(args.round3), desc="MainLoop-Epoch", position=0):
         logging.info("="*80)
-        logging.info(f"Epoch {epoch+1}/{args.round3}")
+        logging.info(f"Epoch {epoch+1}/{args.round3}  [infer={args.inference_mode}]")
 
         # Step 3: init/freeze
         logging.info("Step 3: init/freeze")
-        g_sd = global_model.state_dict()  # 캐시
+        g_sd = global_model.state_dict()
         for client_idx in range(args.num_clients):
             m = client_model_list[client_idx]
             msd = m.state_dict()
-            # reins <- global.reins (load로 동기화; deepcopy 제거)
+
+            # reins <- global.reins
             for k in g_sd.keys():
                 if k.startswith("reins.") and k in msd:
                     msd[k].copy_(g_sd[k])
-            # linear_rein 재초기화 (동일 구조 유지)
+
+            # linear_rein 재초기화
             m.linear_rein = nn.Linear(_small_variant['embed_dim'], args.num_classes).to(device)
-            # reins2/linear_rein2 <- global
+
+            # reins2, linear_rein2 <- global (clean teacher)
             for k in g_sd.keys():
                 if (k.startswith("reins2.") or k.startswith("linear_rein2.")) and k in msd:
                     msd[k].copy_(g_sd[k])
 
-            # global.reins2.*  →  m.reins3.*  로 키 이름을 바꿔 복사
+            # split adapters init from teacher
             for k, v in g_sd.items():
                 if k.startswith("reins2."):
-                    k3 = k.replace("reins2.", "reins3.")
-                    if k3 in msd and msd[k3].shape == v.shape:
-                        msd[k3].copy_(v)
-
-            # global.linear_rein2 → m.linear_rein3
-            for suf in ("weight", "bias"):
-                k2 = f"linear_rein2.{suf}"
-                k3 = f"linear_rein3.{suf}"
-                if (k2 in g_sd) and (k3 in msd) and (msd[k3].shape == g_sd[k2].shape):
-                    msd[k3].copy_(g_sd[k2])
+                    k_clean = k.replace("reins2.", "reins3_clean.")
+                    k_noisy = k.replace("reins2.", "reins3_noisy.")
+                    if k_clean in msd and msd[k_clean].shape == v.shape:
+                        msd[k_clean].copy_(v)
+                    if k_noisy in msd and msd[k_noisy].shape == v.shape:
+                        msd[k_noisy].copy_(v)
+            for suf in ("weight","bias"):
+                k2  = f"linear_rein2.{suf}"
+                k3c = f"linear_rein3_clean.{suf}"
+                k3n = f"linear_rein3_noisy.{suf}"
+                if (k2 in g_sd and k3c in msd and msd[k3c].shape == g_sd[k2].shape):
+                    msd[k3c].copy_(g_sd[k2])
+                if (k2 in g_sd and k3n in msd and msd[k3n].shape == g_sd[k2].shape):
+                    msd[k3n].copy_(g_sd[k2])
 
             m.load_state_dict(msd, strict=True)
 
@@ -401,16 +493,20 @@ def main(args):
                     p.requires_grad = True
                 elif 'reins2.' in n or 'linear_rein2.' in n:
                     p.requires_grad = False
-                elif 'reins3.' in n or 'linear_rein3.' in n:
+                elif ('reins3_clean.' in n) or ('linear_rein3_clean.' in n) \
+                     or ('reins3_noisy.' in n) or ('linear_rein3_noisy.' in n):
                     p.requires_grad = False
                 else:
                     p.requires_grad = False
 
-        # Step 4: train rein
+        # Step 4: train rein (원본 유지)
         logging.info(f"Step 4: train 'rein' ({'fusion' if STEP4_USE_FUSION else 'single'})")
         for client_idx in tqdm(range(args.num_clients), desc="Step4 Clients", leave=False, position=1):
             m = client_model_list[client_idx]
             m.train()
+            for n,p in m.named_parameters():
+                p.requires_grad = ('reins.' in n) or ('linear_rein.' in n)
+
             opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, m.parameters()), lr=args.lr)
             loader = clients_train_loader_list[client_idx]
             class_p = clients_train_class_num_list[client_idx]
@@ -421,21 +517,16 @@ def main(args):
                     targets = targets.to(device, non_blocking=True)
 
                     with torch.amp.autocast('cuda',enabled=USE_AMP):
-                        if STEP4_USE_FUSION:
-                            feats = m.forward_fusion2(inputs)[:, 0, :]
-                        else:
-                            feats = m.forward_features(inputs)[:, 0, :]
+                        feats = m.forward_fusion2(inputs)[:, 0, :] if STEP4_USE_FUSION else m.forward_features(inputs)[:, 0, :]
                         logits = m.linear_rein(feats) + 0.5 * class_p
                         ce_losses = F.cross_entropy(logits, targets, reduction='none')
                         loss = ce_losses.mean()
 
-                    # EMA (벡터화)
                     with torch.no_grad():
                         idxs = torch.as_tensor(batch_indices, dtype=torch.long, device='cpu')
                         vals = ce_losses.detach().to(torch.float32).cpu()
                         old  = loss_ema[idxs]
                         is_nan = torch.isnan(old)
-                        # nan -> init, else ema
                         old[is_nan] = vals[is_nan]
                         old[~is_nan] = EMA_BETA*old[~is_nan] + (1.0-EMA_BETA)*vals[~is_nan]
                         loss_ema[idxs] = old
@@ -443,13 +534,12 @@ def main(args):
 
                     opt.zero_grad(set_to_none=True)
                     if USE_AMP:
-                        scaler.scale(loss).backward()
-                        scaler.step(opt); scaler.update()
+                        scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
                     else:
                         loss.backward(); opt.step()
 
             if EVAL_PER_CLIENT_STEP4:
-                bacc_c, acc_c = calculate_accuracy(m, test_loader, device, mode='fusion' if STEP4_USE_FUSION else 'rein')
+                bacc_c, acc_c = evaluate_inference(m, test_loader, device, args)
                 logging.info(f"Client {client_idx} Step4 - BAcc {bacc_c*100:.2f} | Acc {acc_c*100:.2f}")
 
         # Step 5: GMM split (hysteresis)
@@ -465,7 +555,6 @@ def main(args):
                     sample_labels    = label_buf[client_idxs][valid].numpy()
                     sample_loss_mean = vals[valid]
                     clean_bool = gmm_split_classwise(sample_indices, sample_labels, sample_loss_mean)
-                    # EMA 확률 갱신
                     for idx_i, is_clean in clean_bool.items():
                         p_old = client_clean_prob[client_idx][idx_i]
                         p_new = 1.0 if is_clean else 0.0
@@ -473,32 +562,32 @@ def main(args):
         else:
             logging.info("Step5 skipped (hysteresis)")
 
-        # Step 5b: unfreeze rein2
+        # Step 5b: split-branch만 학습 가능
         for client_idx in range(args.num_clients):
             m = client_model_list[client_idx]
             for n,p in m.named_parameters():
-                if 'reins.' in n or 'linear_rein.' in n:
-                    p.requires_grad = False
-                elif 'reins2.' in n or 'linear_rein2.' in n:
-                    p.requires_grad = False
-                elif 'reins3.' in n or 'linear_rein3.' in n:
-                    p.requires_grad = True
-                else:
-                    p.requires_grad = False
+                p.requires_grad = (
+                    ('reins3_clean.' in n) or ('linear_rein3_clean.' in n) or
+                    ('reins3_noisy.' in n) or ('linear_rein3_noisy.' in n)
+                )
 
-        # Step 6: Distill to global (rein2)
-        logging.info("Step 6: Distillation (clean CE, noisy KL-to-global)")
+        # Step 6: Split-Adapter Distillation
+        logging.info("Step 6: Split-Adapter Distillation (Clean→CE on reins3_clean, Noisy→KD on reins3_noisy)")
         global_model.eval()
-        # 글로벌 reins2 파라미터 스냅샷(프로시말)
         g_reins2_sd = {n: p.detach().clone() for n,p in global_model.reins2.named_parameters()}
+
+        branch_use_clean = 0.0
+        branch_use_noisy = 0.0
+        branch_total     = 0.0
 
         for client_idx in tqdm(range(args.num_clients), desc="Step6 Clients", leave=False, position=1):
             m = client_model_list[client_idx]
             m.train()
-            opt = torch.optim.AdamW(
-                list(m.reins3.parameters()) + list(m.linear_rein3.parameters()),
-                lr=args.lr
-            )
+
+            params = list(m.reins3_clean.parameters()) + list(m.linear_rein3_clean.parameters()) + \
+                     list(m.reins3_noisy.parameters()) + list(m.linear_rein3_noisy.parameters())
+            opt = torch.optim.AdamW(params, lr=args.lr)
+
             loader = clients_train_loader_list[client_idx]
             class_p = clients_train_class_num_list[client_idx]
 
@@ -507,58 +596,97 @@ def main(args):
                     inputs  = inputs.to(device, non_blocking=True)
                     targets = targets.to(device, non_blocking=True)
 
-                    with torch.amp.autocast('cuda',enabled=USE_AMP):
-                        # student
-                        s_feats  = m.forward_features3(inputs)[:, 0, :]
-                        s_logits = m.linear_rein3(s_feats) + 0.5 * class_p
-                        # teacher
-                        with torch.no_grad():
-                            t_feats  = global_model.forward_fusion2(inputs)[:, 0, :]
-                            t_logits = global_model.linear_rein(t_feats) + 0.5 * class_p
-                            t_probsT = F.softmax(t_logits / DISTILL_T, dim=1)
+                    # teacher (global clean)
+                    with torch.no_grad(), torch.amp.autocast('cuda',enabled=USE_AMP):
+                        t_feats  = global_model.forward_features2(inputs)[:, 0, :]
+                        t_logits = global_model.linear_rein2(t_feats) + 0.5 * class_p
+                        t_probsT = F.softmax(t_logits / DISTILL_T, dim=1)
 
-                        # mask (확률 캐시 → 텐서)
-                        with torch.no_grad():
-                            probs = torch.tensor(
-                                [client_clean_prob[client_idx][int(j)] for j in batch_indices],
-                                device=inputs.device, dtype=torch.float32
-                            )
-                            is_clean = probs >= CLEAN_THRESHOLD
+                    # routing
+                    with torch.no_grad():
+                        probs = torch.tensor(
+                            [client_clean_prob[client_idx][int(j)] for j in batch_indices],
+                            device=inputs.device, dtype=torch.float32
+                        )
+                        is_clean = probs >= CLEAN_THRESHOLD
+                        is_noisy = ~is_clean
+                        bc = float(is_clean.sum().item()); bn = float(is_noisy.sum().item()); bt = float(is_clean.numel())
+                        branch_use_clean += bc; branch_use_noisy += bn; branch_total += bt
 
-                        loss = 0.0
-                        if is_clean.any():
-                            loss = loss + F.cross_entropy(s_logits[is_clean], targets[is_clean])
-                        if (~is_clean).any():
-                            s_log_probsT = F.log_softmax(s_logits[~is_clean] / DISTILL_T, dim=1)
-                            kl = F.kl_div(s_log_probsT, t_probsT[~is_clean], reduction='batchmean') * (DISTILL_T ** 2)
-                            loss = loss + KL_WEIGHT * kl
+                    loss = 0.0
+
+                    # clean branch
+                    if is_clean.any():
+                        with torch.amp.autocast('cuda',enabled=USE_AMP):
+                            c_feats  = m.forward_features3_clean(inputs[is_clean])[:, 0, :]
+                            c_logits = m.linear_rein3_clean(c_feats) + 0.5 * class_p
+                            ce = F.cross_entropy(c_logits, targets[is_clean])
+                        loss = loss + ce
+                        if FEDPROX_MU > 0.0:
+                            prox_c = 0.0
+                            for (n,p) in m.reins3_clean.named_parameters():
+                                gp = g_reins2_sd[n.replace("reins3_clean","reins2")]
+                                prox_c = prox_c + (p - gp).pow(2).sum()
+                            loss = loss + FEDPROX_MU * prox_c
+
+                    # noisy branch (KD)
+                    if is_noisy.any():
+                        with torch.amp.autocast('cuda',enabled=USE_AMP):
+                            n_feats  = m.forward_features3_noisy(inputs[is_noisy])[:, 0, :]
+                            n_logits = m.linear_rein3_noisy(n_feats) + 0.5 * class_p
+                            s_logpT  = F.log_softmax(n_logits / DISTILL_T, dim=1)
+                            kl = F.kl_div(s_logpT, t_probsT[is_noisy], reduction='batchmean') * (DISTILL_T ** 2)
                             if FEAT_MSE_WEIGHT > 0.0:
-                                loss = loss + FEAT_MSE_WEIGHT * F.mse_loss(s_feats[~is_clean], t_feats[~is_clean])
-
-                        # FedProx(Prox) on reins2
-                        prox = 0.0
-                        for (n,p) in m.reins3.named_parameters():
-                            gp = g_reins2_sd[n]
-                            prox = prox + (p - gp).pow(2).sum()
-                        loss = loss + FEDPROX_MU * prox
+                                kl = kl + FEAT_MSE_WEIGHT * F.mse_loss(n_feats, t_feats[is_noisy])
+                        loss = loss + KL_WEIGHT * kl
+                        if FEDPROX_MU > 0.0:
+                            prox_n = 0.0
+                            for (n,p) in m.reins3_noisy.named_parameters():
+                                gp = g_reins2_sd[n.replace("reins3_noisy","reins2")]
+                                prox_n = prox_n + (p - gp).pow(2).sum()
+                            loss = loss + FEDPROX_MU * prox_n
 
                     opt.zero_grad(set_to_none=True)
                     if USE_AMP:
-                        scaler.scale(loss).backward()
-                        scaler.step(opt); scaler.update()
+                        scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
                     else:
                         loss.backward(); opt.step()
 
-        # Step 7: Average back to global
-        logging.info("Step 7: Average 'rein2' -> global")
-        average_adapter_to_global(global_model, client_model_list)
+        # Step 7: Average back to global — BOTH BRANCHES (clean & noisy)
+        logging.info("Step 7: Average clean→global.reins2  and  noisy→global.reins2_noisy")
+        logging.info(f"[Routing usage] clean={branch_use_clean/max(branch_total,1.0):.3f}, noisy={branch_use_noisy/max(branch_total,1.0):.3f}")
 
-        bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='rein2')
-        logging.info(f"[Epoch {epoch+1}] BAcc: {bacc*100:.2f}% | Acc: {acc*100:.2f}%")
+        # clean aggregate
+        average_adapter_to_global(
+            global_model, client_model_list,
+            client_prefix="reins3_clean", client_head="linear_rein3_clean",
+            target_prefix="reins2", target_head="linear_rein2", strict_shape=True
+        )
+        # noisy aggregate
+        average_adapter_to_global(
+            global_model, client_model_list,
+            client_prefix="reins3_noisy", client_head="linear_rein3_noisy",
+            target_prefix="reins2_noisy", target_head="linear_rein2_noisy", strict_shape=True
+        )
 
-    logging.info("FedDouble training finished.")
+        bacc, acc = evaluate_inference(global_model, test_loader, device, args)
+        logging.info(f"[Epoch {epoch+1}]  [infer={args.inference_mode}]  BAcc: {bacc*100:.2f}% | Acc: {acc*100:.2f}%")
+
+    logging.info("FedDouble (split-adapter + dual-branch inference) training finished.")
 
 if __name__ == "__main__":
     args = args_parser()
+    # 신규 CLI 옵션이 기존 parser에 없을 수 있으므로 환경변수/기본값으로 덮어씀
+    # (util.options에서 커스텀 인자 추가 못하는 경우를 대비)
+    import argparse as _ap
+    ap = _ap.ArgumentParser(add_help=False)
+    ap.add_argument("--inference_mode", type=str, default="clean", choices=["clean","merged","dual"])
+    ap.add_argument("--merge_eps", type=float, default=0.1)
+    ap.add_argument("--dual_lambda", type=float, default=0.2)
+    ap.add_argument("--dual_entropy_gate", type=float, default=-1.0)
+    extra, _ = ap.parse_known_args()
+    for k,v in vars(extra).items():
+        setattr(args, k, v)
+
     torch.cuda.set_device(args.gpu)
     main(args)

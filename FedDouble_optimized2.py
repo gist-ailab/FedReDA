@@ -64,8 +64,8 @@ LAMBDA_FEAT  = 0.05
 LAMBDA_ORTH  = 1e-3
 
 # Adapter ranks
-R_MAX_ALL = 64   # rein1(Dynamic) r_max
-R1_START  = 8    # rein1 active rank at (re)init
+R_MAX_ALL = 32   # rein1(Dynamic) r_max
+R1_START  = 32   # rein1 active rank at (re)init
 R2_RANK   = 32   # rein2 fixed rank (teacher)
 R3_RANK   = 32   # rein3 fixed rank (student)
 # ======================================================
@@ -490,14 +490,24 @@ def main(args):
 
                     # agreement + hysteresis
                     with torch.no_grad():
-                        g_pred = g_prob.argmax(1); l_pred = l_prob.argmax(1)
-                        g_conf = g_prob.max(1).values; l_conf = l_prob.max(1).values
-                        agree_mask = (g_pred==l_pred) & (g_conf>=TAU_G) & (l_conf>=TAU_L)
+                        # g_pred = g_prob.argmax(1)
+                        # l_pred = l_prob.argmax(1)
+                        # g_conf = g_prob.max(1).values
+                        # l_conf = l_prob.max(1).values
+                        # agree_mask = (g_pred==l_pred) & (g_conf>=TAU_G) & (l_conf>=TAU_L)
+
+                        # probs = torch.tensor([client_clean_prob[cid][int(j)] for j in idxs],
+                        #                      device=x.device, dtype=torch.float32)
+                        # is_clean = agree_mask | (probs >= CLEAN_THRESHOLD)
+                        # client_clean_counts[cid] += float(is_clean.sum().item())
+                        # client_total_counts[cid] += float(is_clean.numel())
+
                         probs = torch.tensor([client_clean_prob[cid][int(j)] for j in idxs],
                                              device=x.device, dtype=torch.float32)
-                        is_clean = agree_mask | (probs >= CLEAN_THRESHOLD)
+                        is_clean = (probs >= CLEAN_THRESHOLD)
                         client_clean_counts[cid] += float(is_clean.sum().item())
                         client_total_counts[cid] += float(is_clean.numel())
+
 
                     # losses (FP32)
                     l_logit = l_logit.float(); l_feat = l_feat.float()
@@ -537,8 +547,11 @@ def main(args):
         # Step7: clean-weighted average (rein3 -> global.reins2)
         logging.info("Step7: Clean-weighted averaging rein3 → global.reins2")
         eps = 1e-8
+        client_clean_pct = (client_clean_counts + eps) / (client_total_counts + eps)
         ratios = (client_clean_counts + eps) / (client_total_counts + eps)
-        weights = ratios / (ratios.sum() + eps)
+        # weights = ratios / (ratios.sum() + eps)
+        weights = client_clean_pct / (client_clean_pct.sum() + eps)
+        global_clean_pct = float(client_clean_counts.sum() / (client_total_counts.sum() + eps))
 
         g_sd = global_model.state_dict()
         tgt_keys = [k for k in g_sd.keys() if k.startswith("reins2.")]
@@ -557,10 +570,18 @@ def main(args):
         g_sd["linear_rein2.bias"  ].copy_(sums["linear_rein2.bias"])
         global_model.load_state_dict(g_sd, strict=True)
 
+        # bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='rein2')
+        # logging.info(f"[Round {epoch+1}] BAcc {bacc*100:.2f}  Acc {acc*100:.2f}  | "
+        #              f"mask_use={(epoch % MASK_UPDATE_EVERY == 0)}  "
+        #              f"avg_clean_ratio={weights.mean():.3f}")
         bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='rein2')
-        logging.info(f"[Round {epoch+1}] BAcc {bacc*100:.2f}  Acc {acc*100:.2f}  | "
-                     f"mask_use={(epoch % MASK_UPDATE_EVERY == 0)}  "
-                     f"avg_clean_ratio={weights.mean():.3f}")
+        logging.info(
+            f"[Round {epoch+1}] "
+            f"BAcc {bacc*100:.2f}  Acc {acc*100:.2f}  | "
+            f"global_clean_pct={global_clean_pct:.3f}  | "
+            f"client_clean_pct={[float(x) for x in client_clean_pct]}  | "
+            f"weights={[float(w) for w in weights]}"
+        )
 
     logging.info("FedDouble training finished.")
 

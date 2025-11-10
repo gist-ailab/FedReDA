@@ -111,8 +111,8 @@ def args_parser():
     p.add_argument('--warm', type=int, default=1)
     # noise
     p.add_argument('--level_n_system', type=float, default=1.0)
-    p.add_argument('--level_n_lowerb', type=float, default=0.1)
-    p.add_argument('--level_n_upperb', type=float, default=0.3)
+    p.add_argument('--level_n_lowerb', type=float, default=0.3)
+    p.add_argument('--level_n_upperb', type=float, default=0.5)
     p.add_argument('--n_type', type=str, default="instance")
     # exp
     p.add_argument('--num_exp', type=int, default=1)
