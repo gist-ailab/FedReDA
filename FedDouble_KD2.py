@@ -72,7 +72,7 @@ TEACHER_SHARPEN_T       = 0.8    # <1이면 샤프닝
 
 # Mask
 USE_GMM_EMA = True
-USE_AGREE_MASK = False
+USE_AGREE_MASK = True
 CLEAN_THRESHOLD = 0.6
 TAU_G = 0.7
 TAU_L = 0.7
