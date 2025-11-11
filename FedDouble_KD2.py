@@ -71,8 +71,8 @@ TEACHER_REIN2_SHARPEN   = False
 TEACHER_SHARPEN_T       = 0.8    # <1이면 샤프닝
 
 # Mask
-USE_STRICT_MASK = False          # True: (agreement&confidence) ∪ GMM-EMA, False: GMM-EMA만
-USE_AGREE_MASK_ONLY = False
+USE_GMM_EMA = True
+USE_AGREE_MASK = False
 CLEAN_THRESHOLD = 0.6
 TAU_G = 0.7
 TAU_L = 0.7
@@ -297,7 +297,7 @@ def main(args):
     logging.info("=" * 60)
     logging.info("FedDouble-2Adapter (Reins-only)")
     logging.info(f"USE_LOO_TEACHER={USE_LOO_TEACHER}")
-    logging.info(f"[MASK] strict={USE_STRICT_MASK} | CLEAN_THR={CLEAN_THRESHOLD}")
+    logging.info(f"[MASK] GMM_MASK={USE_GMM_EMA} | Confience_MASK={USE_AGREE_MASK} | CLEAN_THR={CLEAN_THRESHOLD}")
     logging.info(f"[AVG] use_equal_early={USE_EQUAL_AVG_EARLY}, n={EQUAL_AVG_EPOCHS}")
     logging.info(f"[LOSS] CE={ENABLE_CLEAN_CE}(smooth={CE_LABEL_SMOOTH}) | KD={ENABLE_NOISY_KD}(T={DISTILL_T}) | PROX={ENABLE_ADAPTER_PROX}(mu={FEDPROX_MU})")
 
@@ -494,21 +494,25 @@ def main(args):
 
                     # mask (prev round probs + agreement)
                     with torch.no_grad():
-                        probs = torch.tensor(
-                            [client_clean_prob[cid][int(j)] for j in idxs],
-                            device=x.device, dtype=torch.float32
-                        )
-                        if USE_STRICT_MASK:
+                        if USE_GMM_EMA:
+                            probs = torch.tensor(
+                                [client_clean_prob[cid][int(j)] for j in idxs],
+                                device=x.device, dtype=torch.float32
+                            )
+                        if USE_AGREE_MASK:
                             t_pred = t_prob.argmax(1)
                             s_pred = s_prob.argmax(1)
                             t_conf = t_prob.max(1).values
                             s_conf = s_prob.max(1).values
                             agree = (t_pred == s_pred) & (t_conf >= TAU_G) & (s_conf >= TAU_L)
 
-                            is_clean = agree | (probs >= CLEAN_THRESHOLD)
                             # is_clean = agree | (probs >= CLEAN_THRESHOLD)
-                        else:
+                        if USE_GMM_EMA and USE_AGREE_MASK:
+                            is_clean = agree & (probs >= CLEAN_THRESHOLD)
+                        elif USE_GMM_EMA:
                             is_clean = (probs >= CLEAN_THRESHOLD)
+                        else:
+                            is_clean = agree
 
                         client_clean_counts[cid] += float(is_clean.sum().item())
                         client_total_counts[cid] += float(is_clean.numel())
