@@ -40,6 +40,7 @@ from rein.models.backbones.reins_dinov2 import ReinsDinoVisionTransformer
 from rein.models.backbones.reins import Reins
 from dataset.dataset import get_dataset
 from utils.utils import add_noise
+import time
 
 # =================== System ===================
 USE_AMP = True
@@ -64,15 +65,19 @@ GMM_RANDOM_SEED = 0
 MASK_UPDATE_EVERY = 2
 MASK_MOMENTUM     = 0.8
 
-# Teacher behavior
+#Hyper Parameter
 USE_LOO_TEACHER         = True   # True: LOO teacher, False: shared FedAvg teacher
+ENABLE_NOISY_KD     = True
+USE_AGREE_MASK = True
+ENABLE_ADAPTER_PROX = True
+
+# Teacher behavior
 TEACHER_USE_REIN2_ONLY  = True   # 항상 adapter2(reins2)만 teacher
 TEACHER_REIN2_SHARPEN   = False
 TEACHER_SHARPEN_T       = 0.8    # <1이면 샤프닝
 
 # Mask
 USE_GMM_EMA = True
-USE_AGREE_MASK = True
 CLEAN_THRESHOLD = 0.6
 TAU_G = 0.7
 TAU_L = 0.7
@@ -88,8 +93,6 @@ CE_LABEL_SMOOTH = 0.05
 
 # Loss 토글
 ENABLE_CLEAN_CE     = True
-ENABLE_NOISY_KD     = True
-ENABLE_ADAPTER_PROX = True
 FEDPROX_MU          = 5e-4
 
 # Adapter ranks (Reins 내부에서 사용, 여기서는 구조 통일용)
@@ -120,7 +123,7 @@ def setup_logging(flag=None):
     for h in logger.handlers[:]:
         logger.removeHandler(h)
 
-    fname = 'FedDouble_2Adapter_ReinsOnly.txt' if flag is None else f'FedDouble_2Adapter_ReinsOnly_{flag}.txt'
+    fname = 'FedDouble_KD2.txt' if flag is None else f'FedDouble_KD2_{flag}.txt'
     fh = logging.FileHandler(fname, mode='a')
     fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     logger.addHandler(fh)
@@ -128,6 +131,24 @@ def setup_logging(flag=None):
     ch = logging.StreamHandler()
     ch.setFormatter(logging.Formatter('%(message)s'))
     logger.addHandler(ch)
+    
+class ComputeTracker:
+    def __init__(self, num_gpus=1):
+        self.num_gpus = num_gpus
+        self.train_seconds = 0.0
+        self.infer_seconds = 0.0
+        self.train_samples = 0
+        self.infer_samples = 0
+
+    @property
+    def train_gpu_hours(self):
+        return self.train_seconds * self.num_gpus / 3600.0
+
+    @property
+    def infer_gpu_hours(self):
+        return self.infer_seconds * self.num_gpus / 3600.0
+
+COMPUTE = ComputeTracker(num_gpus=1) 
 
 # ---------- Dataset ----------
 class DatasetSplit(Dataset):
@@ -187,6 +208,40 @@ def calculate_accuracy(model, dataloader, device, mode='student'):
                 logits = model.linear_rein(feats)
         preds.append(torch.argmax(logits, dim=1).cpu())
         targets.append(torch.as_tensor(t))
+    preds = torch.cat(preds).numpy()
+    targets = torch.cat(targets).numpy()
+    return balanced_accuracy_score(targets, preds), accuracy_score(targets, preds)
+
+@torch.no_grad()
+def evaluate_with_timing(model, dataloader, device, mode='teacher', track_compute=False):
+    model = model.to(device)
+    model.eval()
+    preds, targets = [], []
+    n_samples = 0
+    t0 = time.time()
+
+    for inputs, t in dataloader:
+        bs = inputs.size(0)
+        n_samples += bs
+        inputs = inputs.to(device, non_blocking=True).float()
+        with torch.inference_mode(), torch.amp.autocast('cuda', enabled=False):
+            if mode == 'student':
+                feats = model.forward_features(inputs)[:, 0, :]
+                logits = model.linear_rein(feats)
+            elif mode == 'teacher':
+                feats = model.forward_features2(inputs)[:, 0, :]
+                logits = model.linear_rein2(feats)
+            else:
+                feats = model.forward_features(inputs)[:, 0, :]
+                logits = model.linear_rein(feats)
+        preds.append(torch.argmax(logits, dim=1).cpu())
+        targets.append(torch.as_tensor(t))
+
+    t1 = time.time()
+    if track_compute:
+        COMPUTE.infer_seconds += (t1 - t0)
+        COMPUTE.infer_samples += n_samples
+
     preds = torch.cat(preds).numpy()
     targets = torch.cat(targets).numpy()
     return balanced_accuracy_score(targets, preds), accuracy_score(targets, preds)
@@ -292,7 +347,11 @@ def distribute_fedavg_teacher_from_global(client_model_list, global_model):
 
 # ---------- Main ----------
 def main(args):
-    flag = (args.level_n_upperb + args.level_n_lowerb) / 2
+    global COMPUTE
+    flag = str((args.level_n_upperb + args.level_n_lowerb) / 2) +\
+            f"_USE_LOO_TEACHER={USE_LOO_TEACHER}"+\
+            f'_KD={ENABLE_NOISY_KD}' +\
+            f'_Confience_MASK={USE_AGREE_MASK}'
     setup_logging(flag=flag)
     logging.info("=" * 60)
     logging.info("FedDouble-2Adapter (Reins-only)")
@@ -303,6 +362,7 @@ def main(args):
 
     device = torch.device(f"cuda:{args.gpu}")
     scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
+    t_main_start = time.time()
 
     # ----- Data -----
     args.num_users = args.num_clients
@@ -316,6 +376,9 @@ def main(args):
 
     logging.info(f"Dataset '{args.dataset}' with {len(dict_users)} clients.")
     logging.info(f"Noisy train dist: {Counter(dataset_train.targets)}")
+    # print(len(dataset_train))
+    # print(len(dataset_test))
+    # exit()
 
     NUM_SAMPLES = len(dataset_train)
     loss_ema  = torch.full((NUM_SAMPLES,), float('nan'), dtype=torch.float32)
@@ -359,6 +422,18 @@ def main(args):
     global_model.linear_rein2 = nn.Linear(embed_dim, args.num_classes).to(device)
 
     global_model = global_model.to(device)
+    
+    # ----- Model size (parameters) -----
+    total_params = sum(p.numel() for p in global_model.parameters())
+    adapter_params = sum(
+        p.numel() for n, p in global_model.named_parameters()
+        if ('reins' in n) or ('linear_rein' in n)
+    )
+    backbone_params = total_params - adapter_params
+
+    logging.info(f"Total params: {total_params:,} ({total_params/1e6:.3f} M)")
+    logging.info(f"Adapter params (reins*/linear_rein*): {adapter_params:,} ({adapter_params/1e6:.3f} M)")
+    logging.info(f"Backbone params: {backbone_params:,} ({backbone_params/1e6:.3f} M)")
 
     if TORCH_COMPILE:
         try:
@@ -384,6 +459,9 @@ def main(args):
             for x, y, _ in loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
+                
+                COMPUTE.train_samples += x.size(0)
+                
                 with torch.amp.autocast('cuda', enabled=USE_AMP):
                     f = m.forward_features(x)[:, 0, :]
                     z = m.linear_rein(f) + 0.5 * class_p
@@ -413,7 +491,8 @@ def main(args):
         global_model.linear_rein2.weight.data.copy_(W / len(client_model_list))
         global_model.linear_rein2.bias.data.copy_(B / len(client_model_list))
 
-    bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='teacher')
+    # bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='teacher')
+    bacc, acc = evaluate_with_timing(global_model, test_loader, device, mode='teacher', track_compute=True)
     logging.info(f"After Step2 (Teacher init)  BAcc: {bacc*100:.2f}  Acc: {acc*100:.2f}")
 
     # ================== Main Rounds ==================
@@ -474,6 +553,8 @@ def main(args):
                 for x, y, idxs in loader:
                     x = x.to(device, non_blocking=True)
                     y = y.to(device, non_blocking=True)
+                    
+                    COMPUTE.train_samples += x.size(0)
 
                     # student
                     with torch.amp.autocast('cuda', enabled=USE_AMP):
@@ -508,7 +589,7 @@ def main(args):
 
                             # is_clean = agree | (probs >= CLEAN_THRESHOLD)
                         if USE_GMM_EMA and USE_AGREE_MASK:
-                            is_clean = agree & (probs >= CLEAN_THRESHOLD)
+                            is_clean = agree | (probs >= CLEAN_THRESHOLD)
                         elif USE_GMM_EMA:
                             is_clean = (probs >= CLEAN_THRESHOLD)
                         else:
@@ -533,7 +614,7 @@ def main(args):
 
                     # loss
                     s_logit = s_logit.float()
-                    loss = 0.0
+                    loss = torch.tensor(0.0)
 
                     if ENABLE_CLEAN_CE and is_clean.any():
                         loss = loss + F.cross_entropy(
@@ -541,6 +622,7 @@ def main(args):
                             label_smoothing=float(CE_LABEL_SMOOTH)
                         )
 
+                    # nz = np.logical_not(is_clean)
                     nz = ~is_clean
                     if ENABLE_NOISY_KD and nz.any():
                         s_logpT = (s_logit[nz] / DISTILL_T).log_softmax(1)
@@ -558,6 +640,9 @@ def main(args):
                             prox = prox + (p - gp).pow(2).sum()
                         loss = loss + FEDPROX_MU * prox
 
+                    if loss.requires_grad==False:
+                        continue
+                    
                     opt.zero_grad(set_to_none=True)
                     if USE_AMP:
                         scaler.scale(loss).backward()
@@ -629,7 +714,8 @@ def main(args):
         global_model.load_state_dict(g_sd, strict=True)
 
         # monitor teacher
-        bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='teacher')
+        # bacc, acc = calculate_accuracy(global_model, test_loader, device, mode='teacher')
+        bacc, acc = evaluate_with_timing(global_model, test_loader, device, mode='teacher', track_compute=True)
         logging.info(
             f"[Round {epoch+1}] "
             f"BAcc {bacc*100:.2f}  Acc {acc*100:.2f}  | "
@@ -639,6 +725,31 @@ def main(args):
         )
 
     logging.info("FedDouble-2Adapter (Reins-only) training finished.")
+    
+    # ----- Compute summary -----
+    total_wall = time.time() - t_main_start
+
+    # 추론 시간 제외한 "approx. training" 시간
+    train_only = max(total_wall - COMPUTE.infer_seconds, 0.0)
+    COMPUTE.train_seconds = train_only  # 한 번의 run 기준이면 += 보다 = 이 더 안전
+
+    logging.info(f"[Compute] Total wall-clock (train + eval + overhead): {total_wall:.2f} s")
+    logging.info(f"[Compute] Approx. training wall-clock (excluding eval): "
+                 f"{COMPUTE.train_seconds:.2f} s "
+                 f"({COMPUTE.train_gpu_hours:.3f} GPU+CPU hours)")
+    
+    logging.info(f"[Compute] Total train samples processed (with local_ep & rounds): "
+                f"{COMPUTE.train_samples}")
+    
+    if COMPUTE.infer_samples > 0:
+        infer_time_per_1000 = COMPUTE.infer_seconds / COMPUTE.infer_samples * 1000.0
+        infer_gpu_hours_per_1000 = infer_time_per_1000 * COMPUTE.num_gpus / 3600.0
+        logging.info(f"[Compute] Inference: total {COMPUTE.infer_samples} samples, "
+                     f"total wall-clock {COMPUTE.infer_seconds:.2f} s "
+                     f"({COMPUTE.infer_gpu_hours:.3f} GPU+CPU hours)")
+        logging.info(f"[Compute] Inference per 1000 instances: "
+                     f"{infer_time_per_1000:.4f} s "
+                     f"({infer_gpu_hours_per_1000:.6f} GPU+CPU hours)")
 
 if __name__ == "__main__":
     args = args_parser()
