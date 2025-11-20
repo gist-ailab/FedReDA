@@ -1,4 +1,4 @@
-# FedDouble_2Adapter_ReinsOnly.py
+# FedReDA.py
 # - Adapter1 (reins): per-round student, trained on clients, re-init from global each round
 # - Adapter2 (reins2): server / teacher, built from Adapter1 via FedAvg or LOO
 # - Step1: per-client train adapter1 → avg → global.adapter2 (initial teacher)
