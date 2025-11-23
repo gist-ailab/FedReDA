@@ -186,3 +186,5 @@ cython_debug/
 *.pt
 *.ckpt
 *.pth.tmp
+
+results/

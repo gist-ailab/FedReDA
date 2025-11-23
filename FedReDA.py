@@ -447,29 +447,30 @@ def main(args):
 
     # ================== Step1: warmup adapter1 ==================
     logging.info("Step1: Per-client training of Adapter1 (reins) + linear_rein (CE)")
-    for cid in tqdm(range(args.num_clients), desc="Step1 Clients"):
-        m = client_model_list[cid]
-        # train only adapter1
-        for n, p in m.named_parameters():
-            p.requires_grad = ('reins.' in n) or ('linear_rein.' in n)
-        opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, m.parameters()), lr=args.lr)
-        loader = clients_train_loader_list[cid]
-        class_p = clients_train_class_num_list[cid]
-        for _ in range(args.local_ep):
-            for x, y, _ in loader:
-                x = x.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                
-                COMPUTE.train_samples += x.size(0)
-                
-                with torch.amp.autocast('cuda', enabled=USE_AMP):
-                    f = m.forward_features(x)[:, 0, :]
-                    z = m.linear_rein(f) + 0.5 * class_p
-                    ce = F.cross_entropy(z, y)
-                opt.zero_grad(set_to_none=True)
-                scaler.scale(ce).backward()
-                scaler.step(opt)
-                scaler.update()
+    for warmup_ep in range(args.round1):
+        for cid in tqdm(range(args.num_clients), desc="Step1 Clients"):
+            m = client_model_list[cid]
+            # train only adapter1
+            for n, p in m.named_parameters():
+                p.requires_grad = ('reins.' in n) or ('linear_rein.' in n)
+            opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, m.parameters()), lr=args.lr)
+            loader = clients_train_loader_list[cid]
+            class_p = clients_train_class_num_list[cid]
+            for _ in range(args.local_ep):
+                for x, y, _ in loader:
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    
+                    COMPUTE.train_samples += x.size(0)
+                    
+                    with torch.amp.autocast('cuda', enabled=USE_AMP):
+                        f = m.forward_features(x)[:, 0, :]
+                        z = m.linear_rein(f) + 0.5 * class_p
+                        ce = F.cross_entropy(z, y)
+                    opt.zero_grad(set_to_none=True)
+                    scaler.scale(ce).backward()
+                    scaler.step(opt)
+                    scaler.update()
 
     # ================== Step2: init global teacher from adapter1 ==================
     logging.info("Step2: Averaging Adapter1 → init global Adapter2 (teacher)")
