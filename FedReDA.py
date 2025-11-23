@@ -123,7 +123,7 @@ def setup_logging(flag=None):
     for h in logger.handlers[:]:
         logger.removeHandler(h)
 
-    fname = 'results/FedDouble_KD2.txt' if flag is None else f'results/FedDouble_KD2_{flag}.txt'
+    fname = 'results/FedReDA.txt' if flag is None else f'results/FedReDA_{flag}.txt'
     fh = logging.FileHandler(fname, mode='a')
     fh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     logger.addHandler(fh)
