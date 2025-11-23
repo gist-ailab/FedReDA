@@ -187,4 +187,4 @@ cython_debug/
 *.ckpt
 *.pth.tmp
 
-results/
+.results/
